@@ -6,11 +6,12 @@ Target date: tomorrow (Europe/Berlin) by default, so when run at 11:30 CET
 you submit before the 12:00 deadline for that day.
 
 Usage:
-  Set ENTSOE_API_KEY and ARENA_API_KEY (or use .env); then:
+  Put ENTSOE_API_KEY and ARENA_API_KEY in local .env (recommended); then:
 
   python run_daily_submissions.py
   python run_daily_submissions.py --target_date 22-02-2026
   python run_daily_submissions.py --dry_run
+  python run_daily_submissions.py --use_global_env
 
 Schedule at 11:30 CET (Windows Task Scheduler or cron) to run this script.
 """
@@ -20,6 +21,7 @@ import argparse
 import os
 import sys
 from datetime import date, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 # Same directory as this script
@@ -48,6 +50,27 @@ def target_date_to_dd_mm_yyyy(d: date) -> str:
     return d.strftime("%d-%m-%Y")
 
 
+def _load_env_file(path: Path) -> dict:
+    if not path.exists() or not path.is_file():
+        return {}
+    values = {}
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            values[key] = value
+    return values
+
+
+def _load_local_env_values() -> dict:
+    repo_root = Path(__file__).resolve().parent
+    return _load_env_file(repo_root / ".env")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Submit forecasts for all challenges and areas (target = tomorrow by default)."
@@ -63,17 +86,39 @@ def main() -> None:
         action="store_true",
         help="Build payloads only; do not submit.",
     )
+    parser.add_argument(
+        "--use_global_env",
+        action="store_true",
+        help="Allow fallback to globally set ENTSOE_API_KEY/ARENA_API_KEY if missing in local .env.",
+    )
     args = parser.parse_args()
 
-    entsoe_key = os.environ.get("ENTSOE_API_KEY", "")
-    arena_key = os.environ.get("ARENA_API_KEY", "")
-    api_base = os.environ.get("ARENA_API_BASE_URL", "https://api.energy-arena.org")
+    local_env = _load_local_env_values()
+    entsoe_key = local_env.get("ENTSOE_API_KEY", "").strip()
+    arena_key = local_env.get("ARENA_API_KEY", "").strip()
+    api_base = (
+        local_env.get("ARENA_API_BASE_URL", "")
+        or os.environ.get("ARENA_API_BASE_URL", "")
+        or "https://api.energy-arena.org"
+    ).strip()
+
+    if args.use_global_env:
+        entsoe_key = entsoe_key or os.environ.get("ENTSOE_API_KEY", "").strip()
+        arena_key = arena_key or os.environ.get("ARENA_API_KEY", "").strip()
 
     if not entsoe_key:
-        print("Error: ENTSOE_API_KEY must be set.", file=sys.stderr)
+        print(
+            "Error: ENTSOE_API_KEY must be set in local .env "
+            "(or use --use_global_env).",
+            file=sys.stderr,
+        )
         sys.exit(1)
     if not arena_key and not args.dry_run:
-        print("Error: ARENA_API_KEY must be set (or use --dry_run).", file=sys.stderr)
+        print(
+            "Error: ARENA_API_KEY must be set in local .env "
+            "(or use --use_global_env / --dry_run).",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     if args.target_date:

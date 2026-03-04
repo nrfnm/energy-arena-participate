@@ -6,7 +6,8 @@ Uses ENTSO-E data: d-1 actuals for price, d-2 actuals for load and solar.
 Timestamps are shifted to the target date and POSTed to the Arena.
 
 Usage:
-  1. Set ENTSOE_API_KEY and ARENA_API_KEY (or pass --api_key).
+  1. Put ENTSOE_API_KEY and ARENA_API_KEY in local .env (recommended),
+     or pass --api_key / --use_global_env.
   2. Run:
 
   python submit_forecast.py --target_date 21-02-2026 --challenge_id day_ahead_price --area DE_LU
@@ -27,6 +28,7 @@ import argparse
 import os
 import sys
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
@@ -53,6 +55,27 @@ def parse_target_date(s: str) -> date:
         raise ValueError(f"target_date must be DD-MM-YYYY, got {s!r}")
     day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
     return date(year, month, day)
+
+
+def _load_env_file(path: Path) -> dict:
+    if not path.exists() or not path.is_file():
+        return {}
+    values = {}
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            values[key] = value
+    return values
+
+
+def _load_local_env_values() -> dict:
+    repo_root = Path(__file__).resolve().parent
+    return _load_env_file(repo_root / ".env")
 
 
 def _extract_series_from_result(
@@ -251,6 +274,7 @@ def submit(
 
 
 def main() -> None:
+    local_env = _load_local_env_values()
     parser = argparse.ArgumentParser(
         description="Submit a day-ahead forecast to the Energy Arena (ENTSO-E d-1/d-2 persistence)."
     )
@@ -277,14 +301,23 @@ def main() -> None:
     parser.add_argument(
         "--api_key",
         type=str,
-        default=os.environ.get("ARENA_API_KEY", ""),
-        help="Arena API key (or set ARENA_API_KEY).",
+        default=local_env.get("ARENA_API_KEY", "").strip(),
+        help="Arena API key (default: local .env ARENA_API_KEY).",
     )
     parser.add_argument(
         "--api_base",
         type=str,
-        default=os.environ.get("ARENA_API_BASE_URL", "https://api.energy-arena.org"),
+        default=(
+            local_env.get("ARENA_API_BASE_URL", "")
+            or os.environ.get("ARENA_API_BASE_URL", "")
+            or "https://api.energy-arena.org"
+        ).strip(),
         help="Arena API base URL.",
+    )
+    parser.add_argument(
+        "--use_global_env",
+        action="store_true",
+        help="Allow fallback to globally set ENTSOE_API_KEY/ARENA_API_KEY if missing in local .env.",
     )
     parser.add_argument(
         "--dry_run",
@@ -293,12 +326,25 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    entsoe_key = os.environ.get("ENTSOE_API_KEY", "")
+    entsoe_key = local_env.get("ENTSOE_API_KEY", "").strip()
+    arena_key = (args.api_key or "").strip()
+    if args.use_global_env:
+        entsoe_key = entsoe_key or os.environ.get("ENTSOE_API_KEY", "").strip()
+        arena_key = arena_key or os.environ.get("ARENA_API_KEY", "").strip()
+
     if not entsoe_key:
-        print("Error: ENTSOE_API_KEY must be set for fetching ENTSO-E data.", file=sys.stderr)
+        print(
+            "Error: ENTSOE_API_KEY must be set in local .env "
+            "(or use --use_global_env).",
+            file=sys.stderr,
+        )
         sys.exit(1)
-    if not args.api_key and not args.dry_run:
-        print("Error: Arena API key required. Set ARENA_API_KEY or pass --api_key.", file=sys.stderr)
+    if not arena_key and not args.dry_run:
+        print(
+            "Error: Arena API key required. Set ARENA_API_KEY in local .env, "
+            "pass --api_key, or use --use_global_env.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     try:
@@ -329,7 +375,7 @@ def main() -> None:
 
     ok = submit(
         payload=payload,
-        api_key=args.api_key,
+        api_key=arena_key,
         api_base=args.api_base,
         dry_run=args.dry_run,
         verbose=True,
