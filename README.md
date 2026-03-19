@@ -73,6 +73,11 @@ Dry run:
 python submit_forecast.py --target_date 20-02-2026 --dry_run
 ```
 
+Example payload format:
+
+- `example_payload.txt` contains an actual `--dry_run` point payload for `2026-03-20` with `96` quarter-hour timestamps (`00:00` to `23:45`, `Europe/Berlin`).
+- `example_payload_probabilistic.txt` contains the matching actual `--dry_run --include_ensemble` payload for `2026-03-20`, with vector values ordered as `[point, q0.025, q0.25, q0.5, q0.75, q0.975, e1, ..., e10]`.
+
 ### 4) Submit quantiles or ensembles optionally
 
 Quantiles:
@@ -128,5 +133,7 @@ python run_daily_submissions.py --use_global_env
 - `run_daily_submissions.bat` / `run_daily_submissions.ps1` - scheduler-friendly launchers
 - `SCHEDULE.md` - scheduling reference (Windows + cron)
 - `WINDOWS_TASK_SCHEDULER.md` - step-by-step Windows setup
+- `example_payload.txt` - one example submission payload (JSON in `.txt`)
+- `example_payload_probabilistic.txt` - one example payload with point + quantiles + ensembles (JSON in `.txt`)
 - `.env.example` - local config template
 - `requirements.txt` - dependencies
