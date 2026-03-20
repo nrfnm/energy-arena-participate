@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -488,25 +489,43 @@ def submit(
 
         return str(body).strip()
 
+    _TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
+    _RETRY_DELAYS = [5, 15, 30]  # seconds between attempts 1→2, 2→3, 3→4
+
     url = f"{api_base.rstrip('/')}/api/v1/submissions"
     headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
-    try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=30)
-        if not resp.ok:
-            detail = _extract_error_detail(resp)
-            message = f"HTTP {resp.status_code}" + (f" - {detail}" if detail else "")
-            if verbose:
-                print(f"Submit failed: {message}", file=sys.stderr)
-            return False
 
-        if verbose:
-            data = resp.json()
-            print(f"OK -> submission_id={data.get('submission_id')}")
-        return True
-    except requests.RequestException as e:
-        if verbose:
-            print(f"Submit failed: {e}", file=sys.stderr)
-        return False
+    last_message = ""
+    for attempt, delay in enumerate([0] + _RETRY_DELAYS, start=1):
+        if delay:
+            if verbose:
+                print(f"  Retrying in {delay}s (attempt {attempt}/{1 + len(_RETRY_DELAYS)})...")
+            time.sleep(delay)
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=30)
+            if resp.ok:
+                if verbose:
+                    data = resp.json()
+                    print(f"OK -> submission_id={data.get('submission_id')}")
+                return True
+
+            detail = _extract_error_detail(resp)
+            last_message = f"HTTP {resp.status_code}" + (f" - {detail}" if detail else "")
+
+            if resp.status_code not in _TRANSIENT_STATUS_CODES:
+                break  # permanent error, no point retrying
+
+            if verbose:
+                print(f"  Transient error: {last_message}", file=sys.stderr)
+
+        except requests.RequestException as e:
+            last_message = str(e)
+            if verbose:
+                print(f"  Connection error: {last_message}", file=sys.stderr)
+
+    if verbose:
+        print(f"Submit failed: {last_message}", file=sys.stderr)
+    return False
 
 
 def main() -> None:
