@@ -65,11 +65,18 @@ Optional: allow fallback to global environment variables with `--use_global_env`
 python submit_forecast.py --target_date 20-03-2026 --challenge_id day_ahead_price --area DE_LU
 ```
 
-- `target_date`: `DD-MM-YYYY` — **must be tomorrow's date** (the day you are forecasting for). The script fetches ENTSO-E data from the previous day(s) and the data for future days is not yet published, so running with a date more than one day ahead will fail with `NoMatchingDataError`.
+- `target_date`: `DD-MM-YYYY` — **must be tomorrow's date** (the day you are forecasting for).
+  - Using a date **more than one day ahead** fails with `NoMatchingDataError` because the required ENTSO-E source data has not been published yet.
+  - Using a **past date** fails with a "past submission deadline" error from the platform.
 - `challenge_id`: `day_ahead_price` | `day_ahead_load` | `day_ahead_solar` | `day_ahead_wind`
 - `area`: `DE_LU` | `AT`
 
-The script POSTs a JSON payload directly to `{ARENA_API_BASE_URL}/api/v1/submissions`. No local file is needed — the forecast is computed on the fly from ENTSO-E data and sent to the Energy Arena platform in one step.
+**What the script actually does:** it fetches recent ENTSO-E data (e.g. yesterday's day-ahead prices for `day_ahead_price`) and shifts those values to tomorrow as a naive forecast. No custom model file is needed — the ENTSO-E historical data itself is the forecast. The JSON payload is then POSTed directly to `{ARENA_API_BASE_URL}/api/v1/submissions` using your `ARENA_API_KEY`.
+
+**Troubleshooting:**
+- `Submit failed: HTTP 503 - Service Unavailable` → the platform requires an active web login before the API key works. Log in at [energy-arena.org](https://energy-arena.org) once in your browser, then retry the script.
+- `NoMatchingDataError` → use tomorrow's date (ENTSO-E data for that delivery period does not exist yet).
+- `past submission deadline` → only tomorrow's date is accepted.
 
 Optional overrides:
 
