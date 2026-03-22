@@ -175,17 +175,21 @@ def get_probabilistic_settings(
 
 def print_open_challenge_infos(challenge_infos: Dict[str, Any]) -> None:
     """
-    Pretty-print the open challenge metadata returned by the API.
+    Print the open challenge metadata in a compact table.
     """
     active = challenge_infos.get("active_challenges") or []
     if not active:
         print("No open challenges are currently reported by the API.")
         return
 
-    generated_at = challenge_infos.get("generated_at")
-    if generated_at:
-        print(f"Open challenge metadata generated at: {generated_at}")
-        print()
+    headers = (
+        "Name",
+        "Challenge ID",
+        "Areas",
+        "Next Submission Deadline",
+        "Next Target Start",
+    )
+    rows: List[tuple[str, str, str, str, str]] = []
 
     for entry in active:
         if not isinstance(entry, dict):
@@ -196,19 +200,37 @@ def print_open_challenge_infos(challenge_infos: Dict[str, Any]) -> None:
         areas = entry.get("areas") or []
         deadline = entry.get("next_submission_deadline") or "unknown"
         target_start = entry.get("next_target_start") or "unknown"
-        supported = "yes" if challenge_id in CHALLENGE_ENTSOE else "no"
+        rows.append(
+            (
+                challenge_name,
+                challenge_id,
+                ", ".join(str(area) for area in areas) if areas else "-",
+                str(deadline),
+                str(target_start),
+            )
+        )
 
-        print(f"{challenge_id} ({challenge_name})")
-        print(f"  starter repo support: {supported}")
-        print(f"  areas: {', '.join(str(area) for area in areas) if areas else '-'}")
-        print(f"  next submission deadline: {deadline}")
-        print(f"  next target start: {target_start}")
+    widths = [
+        max(len(header), *(len(row[idx]) for row in rows))
+        for idx, header in enumerate(headers)
+    ]
+    format_row = "  ".join(f"{{:<{width}}}" for width in widths)
 
-        payload_example = entry.get("payload_example")
-        if isinstance(payload_example, dict):
-            print("  payload example:")
-            print(json.dumps(payload_example, indent=2))
-        print()
+    print(format_row.format(*headers))
+    print("  ".join("-" * width for width in widths))
+    for row in rows:
+        print(format_row.format(*row))
+
+
+def save_payload_to_file(payload: dict, output_path: str) -> Path:
+    """
+    Write a generated submission payload to a JSON text file.
+    """
+    path = Path(output_path).expanduser()
+    if path.parent and str(path.parent) not in ("", "."):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path.resolve()
 
 
 def _extract_series_from_result(
@@ -486,14 +508,17 @@ def submit(
     api_base: str,
     dry_run: bool = False,
     verbose: bool = True,
+    print_payload_on_dry_run: bool = True,
 ) -> bool:
     """POST payload to the Arena submissions API. Returns True on success."""
     if dry_run:
-        if verbose:
+        if verbose and print_payload_on_dry_run:
             import json
 
             print("Payload (dry run):")
             print(json.dumps(payload, indent=2))
+        elif verbose:
+            print("Dry run: payload not submitted.")
         return True
 
     def _extract_error_detail(response: requests.Response) -> str:
@@ -624,6 +649,12 @@ def main() -> None:
         help="Build and print payload only; do not submit.",
     )
     parser.add_argument(
+        "--save_payload",
+        type=str,
+        default=None,
+        help="Write the generated submission payload to a JSON text file.",
+    )
+    parser.add_argument(
         "--list_open_challenges",
         action="store_true",
         help="Fetch open challenge metadata from the Energy Arena API and exit.",
@@ -752,12 +783,21 @@ def main() -> None:
             traceback.print_exc(file=sys.stderr)
         sys.exit(1)
 
+    if args.save_payload:
+        try:
+            saved_path = save_payload_to_file(payload, args.save_payload)
+        except Exception as e:
+            print(f"Error: failed to save payload: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Saved payload to {saved_path}")
+
     ok = submit(
         payload=payload,
         api_key=arena_key,
         api_base=args.api_base,
         dry_run=args.dry_run,
         verbose=True,
+        print_payload_on_dry_run=not bool(args.save_payload),
     )
     if not ok and not args.dry_run:
         sys.exit(1)

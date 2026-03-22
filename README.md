@@ -67,11 +67,11 @@ python submit_forecast.py --list_open_challenges
 
 This calls the public `GET /api/v1/challenges/open` endpoint and prints:
 
+- challenge names
 - active `challenge_id` values
 - valid `areas`
 - `next_submission_deadline`
 - `next_target_start`
-- a `payload_example`
 
 If you want the raw helper in your own Python code:
 
@@ -83,7 +83,14 @@ from challenge_catalog import get_challenge_infos
 infos = get_challenge_infos(
     os.environ.get("ARENA_API_BASE_URL", "https://api.energy-arena.org"),
 )
-print(infos["active_challenges"])
+for entry in infos["active_challenges"]:
+    print(
+        entry["challenge_name"],
+        entry["challenge_id"],
+        entry["areas"],
+        entry["next_submission_deadline"],
+        entry["next_target_start"],
+    )
 ```
 
 ### 4) Submit one point forecast
@@ -115,6 +122,12 @@ Dry run:
 
 ```bash
 python submit_forecast.py --target_date 20-02-2026 --dry_run
+```
+
+Dry run and save the generated payload to a local text file for inspection:
+
+```bash
+python submit_forecast.py --target_date 20-02-2026 --challenge_id day_ahead_price --area DE_LU --dry_run --save_payload entsoe_payload.txt
 ```
 
 Example payload format:
