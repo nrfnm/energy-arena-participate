@@ -23,6 +23,32 @@ The probabilistic history logic mirrors the current naive benchmark:
 - `ARENA_API_KEY`
 - Arena base URL (default: `https://api.energy-arena.org`)
 
+## Student path
+
+If you want the shortest path to a first successful submission, use exactly this flow:
+
+1. Copy `.env.example` to `.env` and fill your keys
+2. Run `python submit_forecast.py --check_setup`
+3. Run `python submit_forecast.py --list_open_challenges`
+4. Run one dry run and save the payload locally
+5. Submit one real forecast
+
+Minimal commands:
+
+```bash
+# 1) Check that your setup is usable
+python submit_forecast.py --check_setup
+
+# 2) See currently open challenges
+python submit_forecast.py --list_open_challenges
+
+# 3) Dry run first
+python submit_forecast.py --target_date 20-03-2026 --challenge_id day_ahead_price --area DE_LU --dry_run --save_payload test_payload.txt
+
+# 4) Real submission
+python submit_forecast.py --target_date 20-03-2026 --challenge_id day_ahead_price --area DE_LU
+```
+
 ## Quick start
 
 ### 1) Clone/download and install dependencies
@@ -46,6 +72,10 @@ pip install -r requirements.txt
 Copy `.env.example` to `.env` and set your keys:
 
 ```bash
+Windows PowerShell:
+Copy-Item .env.example .env
+
+macOS / Linux:
 cp .env.example .env
 ```
 
@@ -59,7 +89,21 @@ Both scripts read `.env` automatically.
 
 Optional: allow fallback to global environment variables with `--use_global_env`.
 
-### 3) Inspect the currently open challenges
+### 3) Check your setup
+
+```bash
+python submit_forecast.py --check_setup
+```
+
+This verifies:
+
+- whether `.env` exists
+- whether `ENTSOE_API_KEY` is available
+- whether `ARENA_API_KEY` is available
+- whether the open challenge catalog can be reached
+- whether a local `custom_model.py` is picked up successfully
+
+### 4) Inspect the currently open challenges
 
 ```bash
 python submit_forecast.py --list_open_challenges
@@ -101,7 +145,7 @@ for entry in infos["active_challenges"]:
     )
 ```
 
-### 4) Submit one point forecast
+### 5) Submit one point forecast
 
 ```bash
 python submit_forecast.py --target_date 20-03-2026 --challenge_id day_ahead_price --area DE_LU
@@ -143,7 +187,7 @@ Example payload format:
 - `example_payload.txt` contains an actual `--dry_run` point payload for `2026-03-20` with `96` quarter-hour timestamps (`00:00` to `23:45`, `Europe/Berlin`).
 - `example_payload_probabilistic.txt` contains the matching actual `--dry_run --include_ensemble` payload for `2026-03-20`, with vector values ordered as `[point, q0.025, q0.25, q0.5, q0.75, q0.975, e1, ..., e10]`.
 
-### 5) Submit quantiles or ensembles optionally
+### 6) Submit quantiles or ensembles optionally
 
 Quantiles:
 
@@ -162,7 +206,7 @@ Notes:
 - quantile definitions and maximum ensemble size are pulled from the public challenge API when available, otherwise the local fallback mapping is used
 - for a first test, keep the default point-forecast mode and switch on probabilistic output afterwards
 
-### 6) Integrate your own model
+### 7) Integrate your own model
 
 If you want to replace the naive ENTSO-E baseline with your own model, you do
 not need to edit `submit_forecast.py` directly anymore.
@@ -193,7 +237,7 @@ Detailed guide:
 
 - `MODEL_INTEGRATION.md`
 
-### 7) Daily run at 11:30 CET (all 4 challenges x 2 areas)
+### 8) Daily run at 11:30 CET (all 4 challenges x 2 areas)
 
 ```bash
 python run_daily_submissions.py

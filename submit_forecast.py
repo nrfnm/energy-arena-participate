@@ -307,6 +307,78 @@ def _validate_payload(payload: Any, *, source: str) -> dict:
     return payload
 
 
+def run_setup_check(
+    *,
+    entsoe_key: str,
+    arena_key: str,
+    api_base: str,
+) -> int:
+    """
+    Print a small setup diagnosis and return a process exit code.
+    """
+    repo_root = Path(__file__).resolve().parent
+    env_path = repo_root / ".env"
+    problems: List[str] = []
+
+    print("Setup check")
+    print(f"  repo folder: {repo_root}")
+    print(f"  local .env: {'found' if env_path.exists() else 'missing'}")
+    print(f"  ENTSOE_API_KEY: {'ok' if entsoe_key else 'missing'}")
+    print(f"  ARENA_API_KEY: {'ok' if arena_key else 'missing'}")
+    print(f"  ARENA_API_BASE_URL: {api_base}")
+
+    try:
+        challenge_infos = get_challenge_infos(api_base, arena_api_key=arena_key or None)
+    except Exception as exc:
+        problems.append(f"Open challenge catalog unreachable: {exc}")
+    else:
+        active_count = len(challenge_infos.get("active_challenges") or [])
+        print(f"  open challenge catalog: ok ({active_count} active challenge(s))")
+
+    try:
+        custom_model = _load_custom_model_module()
+    except Exception as exc:
+        problems.append(f"custom_model.py failed to load: {exc}")
+    else:
+        if custom_model is None:
+            print(
+                "  custom_model.py: not configured (baseline payload builder will be used)"
+            )
+        else:
+            print("  custom_model.py: loaded")
+
+    if not entsoe_key:
+        problems.append("ENTSOE_API_KEY is missing.")
+    if not arena_key:
+        problems.append("ARENA_API_KEY is missing.")
+
+    print()
+    if problems:
+        print("Problems found:")
+        for item in problems:
+            print(f"  - {item}")
+        print()
+        print("Suggested next steps:")
+        print("  1. Copy .env.example to .env")
+        print("  2. Fill ENTSOE_API_KEY and ARENA_API_KEY")
+        print("  3. Run python submit_forecast.py --check_setup again")
+        return 1
+
+    print("Setup looks good.")
+    print()
+    print("Suggested next steps:")
+    print("  1. python submit_forecast.py --list_open_challenges")
+    print(
+        "  2. python submit_forecast.py --target_date DD-MM-YYYY "
+        "--challenge_id day_ahead_price --area DE_LU --dry_run --save_payload test_payload.txt"
+    )
+    print(
+        "  3. python submit_forecast.py --target_date DD-MM-YYYY "
+        "--challenge_id day_ahead_price --area DE_LU"
+    )
+    return 0
+
+
 def _extract_series_from_result(
     result: Any,
     method_name: str,
@@ -752,7 +824,7 @@ def main() -> None:
         "--target_date",
         type=str,
         default=None,
-        help="Target day in DD-MM-YYYY (e.g. 21-02-2026). Required unless --list_open_challenges is used.",
+        help="Target day in DD-MM-YYYY (e.g. 21-02-2026). Required unless --list_open_challenges or --check_setup is used.",
     )
     parser.add_argument(
         "--challenge_id",
@@ -801,6 +873,11 @@ def main() -> None:
         help="Write the generated submission payload to a JSON text file.",
     )
     parser.add_argument(
+        "--check_setup",
+        action="store_true",
+        help="Validate local keys, API reachability, and custom model loading, then exit.",
+    )
+    parser.add_argument(
         "--list_open_challenges",
         action="store_true",
         help="Fetch open challenge metadata from the Energy Arena API and exit.",
@@ -823,6 +900,15 @@ def main() -> None:
         entsoe_key = entsoe_key or os.environ.get("ENTSOE_API_KEY", "").strip()
         arena_key = arena_key or os.environ.get("ARENA_API_KEY", "").strip()
 
+    if args.check_setup:
+        sys.exit(
+            run_setup_check(
+                entsoe_key=entsoe_key,
+                arena_key=arena_key,
+                api_base=args.api_base,
+            )
+        )
+
     if args.list_open_challenges:
         try:
             challenge_infos = get_challenge_infos(
@@ -838,20 +924,20 @@ def main() -> None:
     if not entsoe_key:
         print(
             "Error: ENTSOE_API_KEY must be set in local .env "
-            "(or use --use_global_env).",
+            "(or use --use_global_env). Run --check_setup for a quick diagnosis.",
             file=sys.stderr,
         )
         sys.exit(1)
     if not arena_key and not args.dry_run:
         print(
             "Error: Arena API key required. Set ARENA_API_KEY in local .env, "
-            "pass --api_key, or use --use_global_env.",
+            "pass --api_key, or use --use_global_env. Run --check_setup for a quick diagnosis.",
             file=sys.stderr,
         )
         sys.exit(1)
     if not args.target_date:
         print(
-            "Error: --target_date is required unless --list_open_challenges is used.",
+            "Error: --target_date is required unless --list_open_challenges or --check_setup is used.",
             file=sys.stderr,
         )
         sys.exit(1)
