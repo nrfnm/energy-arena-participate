@@ -1,35 +1,34 @@
 #!/usr/bin/env python3
 """
-Submit a day-ahead forecast to the Energy Arena from a local machine.
+Submit one forecast to the Energy Arena from a local machine.
 
-Point forecast logic:
-  - day_ahead_price: d-1 ENTSO-E day-ahead prices
-  - day_ahead_load: d-2 ENTSO-E actual load
-  - day_ahead_solar: d-2 ENTSO-E actual solar generation
-  - day_ahead_wind: d-2 ENTSO-E actual onshore wind generation
+Default baseline source:
+  - SMARD public market data (no extra key required)
 
-Optional probabilistic extension:
-  - --include_quantiles: append quantile forecasts estimated from historical
-    analog values.
-  - --include_ensemble: append quantile forecasts plus ensemble members
-    estimated from the same historical analog values.
+Optional advanced baseline source:
+  - ENTSO-E Transparency Platform via ENTSOE_API_KEY
 
-The probabilistic history pattern mirrors the current naive benchmark:
-  - price/load: weekly analogs (d-7, d-14, d-21, ...)
-  - solar/wind: daily submission-aware analogs (d-2, d-3, d-4, ...)
+The script resolves the selected challenge via the live Energy Arena API,
+derives the required payload format from the challenge objective
+(point / quantile / ensemble), and then builds a naive baseline forecast from
+historical data for that target and area.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import importlib.util
+import inspect
+import io
 import json
 import os
 import sys
 import time
-from datetime import date, datetime, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -37,10 +36,18 @@ import pandas as pd
 import requests
 from entsoe import EntsoePandasClient
 
-from challenge_catalog import get_active_challenge_lookup, get_challenge_infos
+from challenge_catalog import (
+    get_active_challenge_lookup,
+    get_challenge_detail,
+    get_challenge_infos,
+)
 
+SMARD_DOWNLOAD_URL = "https://www.smard.de/nip-download-manager/nip/download/market-data"
+DEFAULT_API_BASE = "https://api.energy-arena.org"
+DEFAULT_TIMEZONE = "Europe/Berlin"
+SUPPORTED_DATA_SOURCES = {"smard", "entsoe"}
 
-CHALLENGE_ENTSOE: Dict[str, Dict[str, Any]] = {
+TARGET_BASELINES: Dict[str, Dict[str, Any]] = {
     "day_ahead_price": {
         "entsoe_method": "query_day_ahead_prices",
         "production_type": None,
@@ -48,8 +55,6 @@ CHALLENGE_ENTSOE: Dict[str, Dict[str, Any]] = {
         "history_start_lookback_days": 7,
         "history_step_days": 7,
         "history_count": 20,
-        "fallback_quantiles": [0.025, 0.25, 0.5, 0.75, 0.975],
-        "fallback_max_ensemble_size": 10,
     },
     "day_ahead_load": {
         "entsoe_method": "query_load",
@@ -58,8 +63,6 @@ CHALLENGE_ENTSOE: Dict[str, Dict[str, Any]] = {
         "history_start_lookback_days": 7,
         "history_step_days": 7,
         "history_count": 20,
-        "fallback_quantiles": [0.025, 0.25, 0.5, 0.75, 0.975],
-        "fallback_max_ensemble_size": 10,
     },
     "day_ahead_solar": {
         "entsoe_method": "query_generation",
@@ -68,8 +71,6 @@ CHALLENGE_ENTSOE: Dict[str, Dict[str, Any]] = {
         "history_start_lookback_days": 2,
         "history_step_days": 1,
         "history_count": 20,
-        "fallback_quantiles": [0.025, 0.25, 0.5, 0.75, 0.975],
-        "fallback_max_ensemble_size": 10,
     },
     "day_ahead_wind": {
         "entsoe_method": "query_generation",
@@ -78,22 +79,47 @@ CHALLENGE_ENTSOE: Dict[str, Dict[str, Any]] = {
         "history_start_lookback_days": 2,
         "history_step_days": 1,
         "history_count": 20,
-        "fallback_quantiles": [0.025, 0.25, 0.5, 0.75, 0.975],
-        "fallback_max_ensemble_size": 10,
     },
 }
 
-ALLOWED_AREAS = ["DE_LU", "AT"]
-TZ_NAME = "Europe/Berlin"
 _CUSTOM_MODEL_MODULE: Any | None = None
 _CUSTOM_MODEL_LOAD_ATTEMPTED = False
 
 
-def parse_target_date(s: str) -> date:
-    """Parse DD-MM-YYYY to date."""
-    parts = s.strip().split("-")
+@dataclass(frozen=True)
+class SmardCounterpartSpec:
+    module_id: int
+    region: str
+    resolution: str
+    source_unit: str
+    target_unit: str
+    value_multiplier: float
+
+
+@dataclass(frozen=True)
+class ChallengeContext:
+    challenge_id: str
+    challenge_name: str
+    target_code: str
+    target_name: str
+    area: str
+    areas: List[str]
+    forecast_objective: str
+    accepted_forecast_format: str
+    reference_timezone: str
+    target_period_timezone: str
+    target_period_type: str
+    probabilistic_quantiles: List[float]
+    max_ensemble_size: int
+    smard_counterpart: SmardCounterpartSpec | None
+    baseline_supported: bool
+    challenge_detail: Dict[str, Any]
+
+
+def parse_target_date(raw: str) -> date:
+    parts = str(raw or "").strip().split("-")
     if len(parts) != 3:
-        raise ValueError(f"target_date must be DD-MM-YYYY, got {s!r}")
+        raise ValueError(f"target_date must be DD-MM-YYYY, got {raw!r}")
     day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
     return date(year, month, day)
 
@@ -103,10 +129,10 @@ def _load_env_file(path: Path) -> dict:
         return {}
     values = {}
     for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+        text = line.strip()
+        if not text or text.startswith("#") or "=" not in text:
             continue
-        key, value = line.split("=", 1)
+        key, value = text.split("=", 1)
         key = key.strip()
         value = value.strip().strip('"').strip("'")
         if key:
@@ -119,100 +145,199 @@ def _load_local_env_values() -> dict:
     return _load_env_file(repo_root / ".env")
 
 
-def fetch_challenge_detail(api_base: str, challenge_id: str) -> Optional[dict]:
-    """
-    Fetch public challenge metadata from the Energy-Arena API.
-
-    If this fails, the script falls back to the local mapping above.
-    """
-    url = f"{api_base.rstrip('/')}/api/v1/challenges/{challenge_id}"
-    try:
-        response = requests.get(url, timeout=20)
-    except requests.RequestException:
-        return None
-    if not response.ok:
-        return None
-    try:
-        body = response.json()
-    except Exception:
-        return None
-    return body if isinstance(body, dict) else None
+def _normalized_data_source(raw: str | None) -> str:
+    value = str(raw or "").strip().lower()
+    if not value:
+        return "smard"
+    if value not in SUPPORTED_DATA_SOURCES:
+        raise ValueError(
+            f"Unsupported data source {raw!r}. Choose one of: {sorted(SUPPORTED_DATA_SOURCES)}."
+        )
+    return value
 
 
-def get_probabilistic_settings(
-    challenge_id: str,
-    api_base: str,
-) -> tuple[List[float], int]:
-    """
-    Get quantiles and ensemble size from the challenge API if available.
-    """
-    challenge_cfg = CHALLENGE_ENTSOE[challenge_id]
-    fallback_quantiles = [float(q) for q in challenge_cfg.get("fallback_quantiles", [])]
-    fallback_max_ensemble_size = int(
-        challenge_cfg.get("fallback_max_ensemble_size", 0) or 0
-    )
+def _get_default_data_source(local_env: dict) -> str:
+    for key in ("BASELINE_DATA_SOURCE", "FORECAST_BASELINE_SOURCE", "DATA_SOURCE"):
+        value = str(local_env.get(key, "")).strip()
+        if value:
+            return _normalized_data_source(value)
+    return "smard"
 
-    detail = fetch_challenge_detail(api_base, challenge_id)
-    if not detail:
-        return fallback_quantiles, fallback_max_ensemble_size
 
-    pf_cfg = detail.get("probabilistic_forecast") or {}
-    raw_quantiles = pf_cfg.get("quantiles") or fallback_quantiles
-    raw_max_ensemble_size = pf_cfg.get("max_ensemble_size", fallback_max_ensemble_size)
-
-    quantiles: List[float] = []
-    for q in raw_quantiles:
+def _normalize_float_list(values: Any) -> List[float]:
+    out: List[float] = []
+    for value in values or []:
         try:
-            quantiles.append(float(q))
+            out.append(float(value))
         except (TypeError, ValueError):
             continue
-    quantiles = sorted(quantiles)
-
-    try:
-        max_ensemble_size = int(raw_max_ensemble_size or 0)
-    except (TypeError, ValueError):
-        max_ensemble_size = fallback_max_ensemble_size
-
-    return quantiles, max(0, max_ensemble_size)
+    return out
 
 
-def print_open_challenge_infos(challenge_infos: Dict[str, Any]) -> None:
-    """
-    Print the open challenge metadata in a compact table.
-    """
+def _resolve_forecast_objective(detail: Dict[str, Any]) -> str:
+    raw = str(detail.get("forecast_objective") or "").strip().lower()
+    if raw in {"point", "quantile", "ensemble"}:
+        return raw
+    return "point"
+
+
+def _resolve_challenge_context(
+    *,
+    api_base: str,
+    challenge_id: str,
+    area: str | None,
+    arena_api_key: str | None,
+) -> ChallengeContext:
+    detail = get_challenge_detail(
+        api_base,
+        challenge_id,
+        arena_api_key=arena_api_key,
+    )
+    metadata = detail.get("catalog_metadata") or {}
+    target_code = str(
+        detail.get("target_code")
+        or metadata.get("target_code")
+        or ""
+    ).strip()
+    if not target_code:
+        raise RuntimeError(
+            f"Challenge {challenge_id} does not expose a target_code in the API."
+        )
+
+    areas = [str(item).strip() for item in (detail.get("areas") or []) if str(item).strip()]
+    requested_area = str(area or "").strip()
+    if requested_area:
+        if areas and requested_area not in areas:
+            raise RuntimeError(
+                f"Area '{requested_area}' is not valid for challenge {challenge_id}. API areas: {areas}."
+            )
+        resolved_area = requested_area
+    else:
+        if len(areas) == 1:
+            resolved_area = areas[0]
+        elif metadata.get("area_code"):
+            resolved_area = str(metadata["area_code"]).strip()
+        else:
+            raise RuntimeError(
+                f"Challenge {challenge_id} exposes multiple/no areas. Please pass --area explicitly."
+            )
+
+    pf_cfg = detail.get("probabilistic_forecast") or {}
+    smard_raw = detail.get("smard_counterpart") or None
+    smard_spec = (
+        SmardCounterpartSpec(
+            module_id=int(smard_raw.get("module_id") or 0),
+            region=str(smard_raw.get("region") or "").strip(),
+            resolution=str(smard_raw.get("resolution") or "quarterhour").strip() or "quarterhour",
+            source_unit=str(smard_raw.get("source_unit") or "").strip() or "MWh",
+            target_unit=str(smard_raw.get("target_unit") or "").strip() or "MW",
+            value_multiplier=float(smard_raw.get("value_multiplier") or 1.0),
+        )
+        if isinstance(smard_raw, dict) and smard_raw.get("module_id") and smard_raw.get("region")
+        else None
+    )
+
+    return ChallengeContext(
+        challenge_id=str(detail.get("code") or challenge_id).strip(),
+        challenge_name=str(detail.get("name") or challenge_id).strip(),
+        target_code=target_code,
+        target_name=str(
+            detail.get("target_name")
+            or metadata.get("target_name")
+            or target_code
+        ).strip(),
+        area=resolved_area,
+        areas=areas or ([resolved_area] if resolved_area else []),
+        forecast_objective=_resolve_forecast_objective(detail),
+        accepted_forecast_format=str(
+            detail.get("accepted_forecast_format")
+            or detail.get("forecast_format_label")
+            or metadata.get("forecast_format_label")
+            or "-"
+        ).strip(),
+        reference_timezone=str(detail.get("reference_timezone") or DEFAULT_TIMEZONE).strip()
+        or DEFAULT_TIMEZONE,
+        target_period_timezone=str(
+            (detail.get("target_period") or {}).get("timezone")
+            or detail.get("reference_timezone")
+            or DEFAULT_TIMEZONE
+        ).strip()
+        or DEFAULT_TIMEZONE,
+        target_period_type=str(
+            (detail.get("target_period") or {}).get("type") or "calendar_day"
+        ).strip()
+        or "calendar_day",
+        probabilistic_quantiles=_normalize_float_list(pf_cfg.get("quantiles") or []),
+        max_ensemble_size=max(0, int(pf_cfg.get("max_ensemble_size") or 0)),
+        smard_counterpart=smard_spec,
+        baseline_supported=target_code in TARGET_BASELINES,
+        challenge_detail=detail,
+    )
+
+
+def print_open_challenge_infos(
+    challenge_infos: Dict[str, Any],
+    *,
+    api_base: str,
+    arena_api_key: str | None = None,
+) -> None:
     active = challenge_infos.get("active_challenges") or []
     if not active:
         print("No open challenges are currently reported by the API.")
         return
 
     headers = (
-        "Name",
         "Challenge ID",
+        "Target",
+        "Area",
         "Forecast Format",
-        "Areas",
+        "Baseline Source",
         "Next Submission Deadline",
         "Next Target Start",
     )
-    rows: List[tuple[str, str, str, str, str, str]] = []
+    rows: List[tuple[str, str, str, str, str, str, str]] = []
 
     for entry in active:
         if not isinstance(entry, dict):
             continue
+        challenge_id = str(entry.get("challenge_id") or "").strip()
+        challenge_name = str(entry.get("challenge_name") or challenge_id).strip()
+        areas = [str(area).strip() for area in (entry.get("areas") or []) if str(area).strip()]
+        area_label = areas[0] if len(areas) == 1 else ", ".join(areas) if areas else "-"
+        forecast_format = str(entry.get("accepted_forecast_format") or "-").strip()
+        deadline = str(entry.get("next_submission_deadline") or "-").strip()
+        target_start = str(entry.get("next_target_start") or "-").strip()
 
-        challenge_id = str(entry.get("challenge_id", "unknown"))
-        challenge_name = str(entry.get("challenge_name", challenge_id))
-        forecast_format = str(entry.get("accepted_forecast_format", "pf"))
-        areas = entry.get("areas") or []
-        deadline = entry.get("next_submission_deadline") or "unknown"
-        target_start = entry.get("next_target_start") or "unknown"
+        baseline_source = "-"
+        if challenge_id:
+            try:
+                detail = get_challenge_detail(
+                    api_base,
+                    challenge_id,
+                    arena_api_key=arena_api_key,
+                )
+            except Exception:
+                detail = None
+            if isinstance(detail, dict):
+                target_code = str(
+                    detail.get("target_code")
+                    or (detail.get("catalog_metadata") or {}).get("target_code")
+                    or ""
+                ).strip()
+                if detail.get("smard_counterpart"):
+                    baseline_source = "smard"
+                elif target_code in TARGET_BASELINES:
+                    baseline_source = "entsoe"
+
         rows.append(
             (
-                challenge_name,
-                challenge_id,
+                challenge_id or "-",
+                challenge_name or "-",
+                area_label,
                 forecast_format,
-                ", ".join(str(area) for area in areas) if areas else "-",
-                str(deadline),
-                str(target_start),
+                baseline_source,
+                deadline,
+                target_start,
             )
         )
 
@@ -221,22 +346,13 @@ def print_open_challenge_infos(challenge_infos: Dict[str, Any]) -> None:
         for idx, header in enumerate(headers)
     ]
     format_row = "  ".join(f"{{:<{width}}}" for width in widths)
-
     print(format_row.format(*headers))
     print("  ".join("-" * width for width in widths))
     for row in rows:
         print(format_row.format(*row))
-    print()
-    print("Legend:")
-    print("  pf = point forecast")
-    print("  qX = quantile forecast at X percent (for example q2.5 = 2.5th percentile)")
-    print("  eX = ensemble member X")
 
 
 def save_payload_to_file(payload: dict, output_path: str) -> Path:
-    """
-    Write a generated submission payload to a JSON text file.
-    """
     path = Path(output_path).expanduser()
     if path.parent and str(path.parent) not in ("", "."):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -245,9 +361,6 @@ def save_payload_to_file(payload: dict, output_path: str) -> Path:
 
 
 def _load_custom_model_module() -> Any | None:
-    """
-    Load custom_model.py once if the user created it locally.
-    """
     global _CUSTOM_MODEL_MODULE
     global _CUSTOM_MODEL_LOAD_ATTEMPTED
 
@@ -278,32 +391,38 @@ def _load_custom_model_module() -> Any | None:
         getattr(module, "transform_payload", None)
     ):
         raise RuntimeError(
-            f"{custom_model_path.name} must define build_payload(...) "
-            "or transform_payload(...)."
+            f"{custom_model_path.name} must define build_payload(...) or transform_payload(...)."
         )
 
     _CUSTOM_MODEL_MODULE = module
     return module
 
 
+def _call_hook(func: Callable[..., Any], **kwargs: Any) -> Any:
+    signature = inspect.signature(func)
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+        return func(**kwargs)
+    filtered = {
+        key: value for key, value in kwargs.items() if key in signature.parameters
+    }
+    return func(**filtered)
+
+
 def _validate_payload(payload: Any, *, source: str) -> dict:
-    """
-    Validate the minimal submission payload shape after a custom hook ran.
-    """
     if not isinstance(payload, dict):
         raise RuntimeError(f"{source} must return a dictionary payload.")
-
-    missing = [
-        key
-        for key in ("challenge_id", "area", "target_start", "points")
-        if key not in payload
-    ]
-    if missing:
-        raise RuntimeError(f"{source} returned a payload missing keys: {missing}")
-
-    if not isinstance(payload.get("points"), list):
+    if "challenge_id" not in payload:
+        raise RuntimeError(f"{source} returned a payload missing key: ['challenge_id']")
+    has_points = "points" in payload
+    has_values = "values" in payload
+    if has_points == has_values:
+        raise RuntimeError(
+            f"{source} must return exactly one of payload['points'] or payload['values']."
+        )
+    if has_points and not isinstance(payload.get("points"), list):
         raise RuntimeError(f"{source} returned payload['points'] that is not a list.")
-
+    if has_values and not isinstance(payload.get("values"), list):
+        raise RuntimeError(f"{source} returned payload['values'] that is not a list.")
     return payload
 
 
@@ -312,10 +431,8 @@ def run_setup_check(
     entsoe_key: str,
     arena_key: str,
     api_base: str,
+    data_source: str,
 ) -> int:
-    """
-    Print a small setup diagnosis and return a process exit code.
-    """
     repo_root = Path(__file__).resolve().parent
     env_path = repo_root / ".env"
     problems: List[str] = []
@@ -323,8 +440,9 @@ def run_setup_check(
     print("Setup check")
     print(f"  repo folder: {repo_root}")
     print(f"  local .env: {'found' if env_path.exists() else 'missing'}")
-    print(f"  ENTSOE_API_KEY: {'ok' if entsoe_key else 'missing'}")
+    print(f"  baseline data source: {data_source}")
     print(f"  ARENA_API_KEY: {'ok' if arena_key else 'missing'}")
+    print(f"  ENTSOE_API_KEY: {'ok (optional)' if entsoe_key else 'missing (optional)'}")
     print(f"  ARENA_API_BASE_URL: {api_base}")
 
     try:
@@ -341,16 +459,14 @@ def run_setup_check(
         problems.append(f"custom_model.py failed to load: {exc}")
     else:
         if custom_model is None:
-            print(
-                "  custom_model.py: not configured (baseline payload builder will be used)"
-            )
+            print("  custom_model.py: not configured (baseline builder will be used)")
         else:
             print("  custom_model.py: loaded")
 
-    if not entsoe_key:
-        problems.append("ENTSOE_API_KEY is missing.")
     if not arena_key:
         problems.append("ARENA_API_KEY is missing.")
+    if data_source == "entsoe" and not entsoe_key:
+        problems.append("ENTSOE_API_KEY is required when baseline data source is 'entsoe'.")
 
     print()
     if problems:
@@ -360,8 +476,12 @@ def run_setup_check(
         print()
         print("Suggested next steps:")
         print("  1. Copy .env.example to .env")
-        print("  2. Fill ENTSOE_API_KEY and ARENA_API_KEY")
-        print("  3. Run python submit_forecast.py --check_setup again")
+        print("  2. Fill ARENA_API_KEY")
+        if data_source == "entsoe":
+            print("  3. Fill ENTSOE_API_KEY or switch to --data_source smard")
+        else:
+            print("  3. Optionally add ENTSOE_API_KEY if you want --data_source entsoe")
+        print("  4. Run python submit_forecast.py --check_setup again")
         return 1
 
     print("Setup looks good.")
@@ -370,11 +490,11 @@ def run_setup_check(
     print("  1. python submit_forecast.py --list_open_challenges")
     print(
         "  2. python submit_forecast.py --target_date DD-MM-YYYY "
-        "--challenge_id day_ahead_price --area DE_LU --dry_run --save_payload test_payload.txt"
+        "--challenge_id <challenge_id> --dry_run --save_payload test_payload.txt"
     )
     print(
         "  3. python submit_forecast.py --target_date DD-MM-YYYY "
-        "--challenge_id day_ahead_price --area DE_LU"
+        "--challenge_id <challenge_id>"
     )
     return 0
 
@@ -386,7 +506,6 @@ def _extract_series_from_result(
     start: pd.Timestamp,
     end: pd.Timestamp,
 ) -> pd.Series:
-    """Convert ENTSO-E client result to a single pd.Series for [start, end)."""
     if isinstance(result, pd.DataFrame) and isinstance(result.columns, pd.MultiIndex):
         result = result.copy()
         result.columns = [
@@ -427,45 +546,194 @@ def _extract_series_from_result(
         series.index = pd.to_datetime(series.index)
     if isinstance(series.index, pd.MultiIndex):
         raise RuntimeError("Series has MultiIndex, not supported")
+
     series = series.sort_index()
     series = series[(series.index >= start) & (series.index < end)]
-    return series
+    return series.replace([float("inf"), float("-inf")], float("nan")).dropna()
 
 
 def fetch_entsoe_series(
+    *,
     api_key: str,
-    entsoe_method: str,
-    area: str,
+    context: ChallengeContext,
     delivery_date: date,
-    tz: str = TZ_NAME,
-    production_type: Optional[str] = None,
 ) -> pd.Series:
-    """Fetch one day of ENTSO-E data. Returns empty Series if missing."""
+    if not api_key:
+        raise RuntimeError("ENTSOE_API_KEY is required for --data_source entsoe.")
+    if context.target_code not in TARGET_BASELINES:
+        raise RuntimeError(
+            f"Target '{context.target_code}' is not supported by the built-in ENTSO-E baseline."
+        )
+
+    challenge_cfg = TARGET_BASELINES[context.target_code]
+    entsoe_method = str(challenge_cfg["entsoe_method"])
+    production_type = challenge_cfg.get("production_type")
+    tz_name = context.reference_timezone or DEFAULT_TIMEZONE
+
     client = EntsoePandasClient(api_key=api_key)
-    start_ts = pd.Timestamp(delivery_date, tz=tz)
+    start_ts = pd.Timestamp(delivery_date, tz=tz_name)
     end_ts = start_ts + pd.Timedelta(days=1)
     method = getattr(client, entsoe_method, None)
     if method is None:
         raise RuntimeError(f"EntsoePandasClient has no method {entsoe_method!r}")
 
-    result = method(country_code=area, start=start_ts, end=end_ts)
-    series = _extract_series_from_result(
-        result, entsoe_method, production_type, start_ts, end_ts
+    result = method(country_code=context.area, start=start_ts, end=end_ts)
+    return _extract_series_from_result(
+        result,
+        entsoe_method,
+        production_type,
+        start_ts,
+        end_ts,
     )
-    series = series.replace([float("inf"), float("-inf")], float("nan")).dropna()
-    return series
+
+
+def _parse_smard_numeric(raw: str) -> float:
+    text = raw.strip().replace(" ", "")
+    if "," in text and "." in text:
+        text = text.replace(",", "")
+    elif "," in text:
+        text = text.replace(",", ".")
+    return float(text)
+
+
+def _parse_smard_local_timestamp(
+    raw: str,
+    *,
+    local_tz: ZoneInfo,
+    previous_utc: Optional[datetime],
+) -> datetime:
+    naive = datetime.strptime(raw.strip(), "%b %d, %Y %I:%M %p")
+    candidates = sorted(
+        {
+            naive.replace(tzinfo=local_tz, fold=0).astimezone(timezone.utc),
+            naive.replace(tzinfo=local_tz, fold=1).astimezone(timezone.utc),
+        }
+    )
+    if previous_utc is None:
+        return candidates[0]
+    for candidate in candidates:
+        if candidate > previous_utc:
+            return candidate
+    return candidates[-1]
+
+
+def _parse_smard_csv_points(
+    content: bytes,
+    *,
+    timezone_name: str,
+    value_multiplier: float,
+) -> list[dict]:
+    text = content.decode("utf-8-sig")
+    reader = csv.reader(io.StringIO(text), delimiter=";")
+    rows = list(reader)
+    if len(rows) <= 1:
+        return []
+
+    local_tz = ZoneInfo(timezone_name)
+    previous_ts: Optional[datetime] = None
+    out: list[dict] = []
+
+    for row in rows[1:]:
+        if len(row) < 3:
+            continue
+        start_raw = (row[0] or "").strip()
+        value_raw = (row[2] or "").strip()
+        if not start_raw or not value_raw:
+            continue
+        try:
+            ts_utc = _parse_smard_local_timestamp(
+                start_raw,
+                local_tz=local_tz,
+                previous_utc=previous_ts,
+            )
+            value = _parse_smard_numeric(value_raw) * value_multiplier
+        except (TypeError, ValueError):
+            continue
+        out.append({"ts": ts_utc, "value": float(value)})
+        previous_ts = ts_utc
+
+    return out
+
+
+def fetch_smard_series(
+    *,
+    context: ChallengeContext,
+    delivery_date: date,
+) -> pd.Series:
+    if context.smard_counterpart is None:
+        raise RuntimeError(
+            f"Challenge {context.challenge_id} ({context.target_code}/{context.area}) "
+            "does not expose a confirmed SMARD counterpart. "
+            "Use --data_source entsoe if you want to build a baseline anyway."
+        )
+
+    tz_name = context.reference_timezone or DEFAULT_TIMEZONE
+    tz = ZoneInfo(tz_name)
+    start_dt = datetime(delivery_date.year, delivery_date.month, delivery_date.day, tzinfo=tz)
+    end_dt = start_dt + timedelta(days=1)
+    spec = context.smard_counterpart
+
+    payload = {
+        "request_form": [
+            {
+                "format": "CSV",
+                "moduleIds": [spec.module_id],
+                "region": spec.region,
+                "timestamp_from": int(start_dt.timestamp() * 1000),
+                "timestamp_to": int(end_dt.timestamp() * 1000),
+                "type": "discrete",
+                "language": "en",
+                "resolution": spec.resolution,
+            }
+        ]
+    }
+
+    try:
+        response = requests.post(SMARD_DOWNLOAD_URL, json=payload, timeout=45)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"SMARD request failed for {context.challenge_id}/{context.area}: {exc}"
+        ) from exc
+
+    points = _parse_smard_csv_points(
+        response.content,
+        timezone_name=tz_name,
+        value_multiplier=spec.value_multiplier,
+    )
+    if not points:
+        return pd.Series(dtype=float)
+
+    index = pd.to_datetime([item["ts"] for item in points], utc=True)
+    values = [float(item["value"]) for item in points]
+    return pd.Series(values, index=index).sort_index()
+
+
+def _fetch_source_series(
+    *,
+    data_source: str,
+    context: ChallengeContext,
+    delivery_date: date,
+    entsoe_api_key: str,
+) -> pd.Series:
+    if data_source == "smard":
+        return fetch_smard_series(context=context, delivery_date=delivery_date)
+    if data_source == "entsoe":
+        return fetch_entsoe_series(
+            api_key=entsoe_api_key,
+            context=context,
+            delivery_date=delivery_date,
+        )
+    raise RuntimeError(f"Unsupported data source: {data_source}")
 
 
 def _series_to_shifted_points(
     series: pd.Series,
+    *,
     lookback_days: int,
     tz_name: str,
 ) -> List[Dict[str, float | str]]:
-    """
-    Shift a fetched ENTSO-E series forward to the target date grid.
-    """
     tz = ZoneInfo(tz_name)
-    delta = timedelta(days=lookback_days)
     points: List[Dict[str, float | str]] = []
 
     for ts, value in series.items():
@@ -474,243 +742,234 @@ def _series_to_shifted_points(
         else:
             ts_dt = datetime.fromisoformat(str(ts))
         if ts_dt.tzinfo is None:
-            ts_dt = ts_dt.replace(tzinfo=tz)
-        new_ts = ts_dt + delta
-        points.append({"ts": new_ts.isoformat(), "value": float(value)})
+            ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+        shifted_local = ts_dt.astimezone(tz) + timedelta(days=lookback_days)
+        points.append({"ts": shifted_local.isoformat(), "value": float(value)})
 
-    points.sort(key=lambda p: str(p["ts"]))
+    points.sort(key=lambda item: str(item["ts"]))
     return points
 
 
 def collect_probabilistic_history_samples(
+    *,
     target_date: date,
-    challenge_id: str,
-    area: str,
+    context: ChallengeContext,
+    data_source: str,
     entsoe_api_key: str,
-    tz_name: str = TZ_NAME,
 ) -> Dict[str, List[float]]:
-    """
-    Collect historical analog values per target timestamp.
-    """
-    challenge_cfg = CHALLENGE_ENTSOE[challenge_id]
-    entsoe_method = str(challenge_cfg["entsoe_method"])
-    production_type = challenge_cfg.get("production_type")
-    start_lookback_days = int(challenge_cfg["history_start_lookback_days"])
-    step_days = int(challenge_cfg["history_step_days"])
-    history_count = int(challenge_cfg["history_count"])
+    if context.target_code not in TARGET_BASELINES:
+        raise RuntimeError(
+            f"Target '{context.target_code}' is not supported by the built-in baseline."
+        )
 
+    target_cfg = TARGET_BASELINES[context.target_code]
     history_by_ts: Dict[str, List[float]] = {}
+
+    start_lookback_days = int(target_cfg["history_start_lookback_days"])
+    step_days = int(target_cfg["history_step_days"])
+    history_count = int(target_cfg["history_count"])
+    tz_name = context.reference_timezone or DEFAULT_TIMEZONE
+
     for i in range(history_count):
         lookback_days = start_lookback_days + i * step_days
         delivery_date = target_date - timedelta(days=lookback_days)
-        series = fetch_entsoe_series(
-            api_key=entsoe_api_key,
-            entsoe_method=entsoe_method,
-            area=area,
+        series = _fetch_source_series(
+            data_source=data_source,
+            context=context,
             delivery_date=delivery_date,
-            tz=tz_name,
-            production_type=production_type,
+            entsoe_api_key=entsoe_api_key,
         )
         if series.empty:
             continue
 
-        for point in _series_to_shifted_points(series, lookback_days, tz_name):
+        for point in _series_to_shifted_points(
+            series,
+            lookback_days=lookback_days,
+            tz_name=tz_name,
+        ):
             ts = str(point["ts"])
             history_by_ts.setdefault(ts, []).append(float(point["value"]))
 
     return history_by_ts
 
 
-def attach_probabilistic_vectors(
-    points: List[Dict[str, float | str]],
-    quantiles: List[float],
-    max_ensemble_size: int,
-    history_by_ts: Dict[str, List[float]],
-    include_quantiles: bool,
-    include_ensemble: bool,
+def _attach_objective_values(
+    *,
+    base_points: List[Dict[str, float | str]],
+    context: ChallengeContext,
+    history_by_ts: Dict[str, List[float]] | None = None,
 ) -> List[Dict[str, float | str | List[float]]]:
-    """
-    Convert point forecast entries into [pf, q1, ..., qN, e1, ..., eM].
-    """
-    include_quantiles = include_quantiles or include_ensemble
-    ensemble_size = max_ensemble_size if include_ensemble else 0
+    objective = context.forecast_objective
+    if objective == "point":
+        return base_points
 
-    if not include_quantiles and ensemble_size <= 0:
-        return points
-
+    history_lookup = history_by_ts or {}
     out: List[Dict[str, float | str | List[float]]] = []
-    for point in points:
-        pf = float(point["value"])
-        ts = str(point["ts"])
-        history_values = history_by_ts.get(ts, [])
 
-        if include_quantiles and quantiles:
-            if history_values:
-                q_vals = np.quantile(
-                    np.array(history_values, dtype=float), quantiles
+    for point in base_points:
+        ts = str(point["ts"])
+        pf = float(point["value"])
+        history_values = [float(v) for v in history_lookup.get(ts, [])]
+
+        if objective == "quantile":
+            if context.probabilistic_quantiles and history_values:
+                values = np.quantile(
+                    np.array(history_values, dtype=float),
+                    context.probabilistic_quantiles,
                 ).tolist()
             else:
-                q_vals = [pf for _ in quantiles]
-        else:
-            q_vals = []
+                values = [pf for _ in context.probabilistic_quantiles]
+            out.append({"ts": ts, "value": [float(v) for v in values]})
+            continue
 
-        if ensemble_size > 0:
+        if objective == "ensemble":
+            ensemble_size = context.max_ensemble_size
             if history_values:
-                ensemble_vals = [float(v) for v in history_values[:ensemble_size]]
-                if len(ensemble_vals) < ensemble_size:
-                    pad_value = ensemble_vals[-1] if ensemble_vals else pf
-                    ensemble_vals.extend(
-                        [float(pad_value)] * (ensemble_size - len(ensemble_vals))
-                    )
+                values = history_values[:ensemble_size]
+                if len(values) < ensemble_size:
+                    pad_value = values[-1] if values else pf
+                    values.extend([float(pad_value)] * (ensemble_size - len(values)))
             else:
-                ensemble_vals = [pf for _ in range(ensemble_size)]
-        else:
-            ensemble_vals = []
+                values = [pf for _ in range(ensemble_size)]
+            out.append({"ts": ts, "value": [float(v) for v in values]})
+            continue
 
-        out.append(
-            {
-                "ts": ts,
-                "value": [pf, *[float(v) for v in q_vals], *ensemble_vals],
-            }
-        )
+        out.append({"ts": ts, "value": pf})
 
     return out
 
 
-def build_payload_from_entsoe(
+def build_payload_from_source(
+    *,
     target_date: date,
-    challenge_id: str,
-    area: str,
+    context: ChallengeContext,
+    data_source: str,
     entsoe_api_key: str,
-    api_base: str = "https://api.energy-arena.org",
-    include_quantiles: bool = False,
-    include_ensemble: bool = False,
-    tz_name: str = TZ_NAME,
 ) -> dict:
-    """
-    Fetch ENTSO-E data, shift to target_date, and build a submission payload.
-    """
-    if challenge_id not in CHALLENGE_ENTSOE:
-        raise ValueError(f"Unknown challenge_id: {challenge_id}")
+    if not context.baseline_supported:
+        raise RuntimeError(
+            f"Target '{context.target_code}' is not supported by the built-in baseline. "
+            "Provide your own custom_model.py override."
+        )
 
-    challenge_cfg = CHALLENGE_ENTSOE[challenge_id]
-    entsoe_method = str(challenge_cfg["entsoe_method"])
-    production_type = challenge_cfg.get("production_type")
-    lookback_days = int(challenge_cfg["point_lookback_days"])
+    target_cfg = TARGET_BASELINES[context.target_code]
+    lookback_days = int(target_cfg["point_lookback_days"])
     delivery_date = target_date - timedelta(days=lookback_days)
+    tz_name = context.reference_timezone or DEFAULT_TIMEZONE
 
-    series = fetch_entsoe_series(
-        api_key=entsoe_api_key,
-        entsoe_method=entsoe_method,
-        area=area,
+    series = _fetch_source_series(
+        data_source=data_source,
+        context=context,
         delivery_date=delivery_date,
-        tz=tz_name,
-        production_type=production_type,
+        entsoe_api_key=entsoe_api_key,
     )
     if series.empty:
+        source_label = "SMARD" if data_source == "smard" else "ENTSO-E"
         raise RuntimeError(
-            f"No ENTSO-E data for {challenge_id}/{area} on {delivery_date} (d-{lookback_days}). "
-            "Data may not be published yet."
+            f"No {source_label} data for {context.target_code}/{context.area} "
+            f"on {delivery_date} (d-{lookback_days}). Data may not be published yet."
         )
 
-    points = _series_to_shifted_points(series, lookback_days, tz_name)
+    points = _series_to_shifted_points(
+        series,
+        lookback_days=lookback_days,
+        tz_name=tz_name,
+    )
 
-    if include_quantiles or include_ensemble:
-        quantiles, max_ensemble_size = get_probabilistic_settings(
-            challenge_id=challenge_id,
-            api_base=api_base,
-        )
+    history_by_ts: Dict[str, List[float]] | None = None
+    if context.forecast_objective in {"quantile", "ensemble"}:
         history_by_ts = collect_probabilistic_history_samples(
             target_date=target_date,
-            challenge_id=challenge_id,
-            area=area,
+            context=context,
+            data_source=data_source,
             entsoe_api_key=entsoe_api_key,
-            tz_name=tz_name,
-        )
-        points = attach_probabilistic_vectors(
-            points=points,
-            quantiles=quantiles,
-            max_ensemble_size=max_ensemble_size,
-            history_by_ts=history_by_ts,
-            include_quantiles=include_quantiles,
-            include_ensemble=include_ensemble,
         )
 
-    tz = ZoneInfo(tz_name)
-    target_start = datetime(
-        target_date.year, target_date.month, target_date.day, 0, 0, 0, tzinfo=tz
+    payload_points = _attach_objective_values(
+        base_points=points,
+        context=context,
+        history_by_ts=history_by_ts,
     )
-    return {
-        "challenge_id": challenge_id,
-        "area": area,
-        "target_start": target_start.isoformat(),
-        "points": points,
-    }
+
+    payload_values = [point["value"] for point in payload_points]
+    payload: dict[str, Any] = {"challenge_id": context.challenge_id, "values": payload_values}
+
+    if len(context.areas) != 1:
+        payload["area"] = context.area
+
+    if context.target_period_type.lower() == "calendar_day":
+        payload["target_date"] = target_date.isoformat()
+    else:
+        tz = ZoneInfo(context.target_period_timezone or tz_name)
+        target_start = datetime(
+            target_date.year,
+            target_date.month,
+            target_date.day,
+            0,
+            0,
+            0,
+            tzinfo=tz,
+        )
+        payload["target_start"] = target_start.isoformat()
+
+    return payload
 
 
 def build_payload(
+    *,
     target_date: date,
     challenge_id: str,
-    area: str,
+    area: str | None,
     entsoe_api_key: str,
-    api_base: str = "https://api.energy-arena.org",
-    include_quantiles: bool = False,
-    include_ensemble: bool = False,
-    tz_name: str = TZ_NAME,
+    api_base: str = DEFAULT_API_BASE,
+    data_source: str = "smard",
+    arena_api_key: str | None = None,
+    challenge_context: ChallengeContext | None = None,
 ) -> dict:
-    """
-    Shared payload builder used by both single submissions and daily automation.
+    data_source = _normalized_data_source(data_source)
+    context = challenge_context or _resolve_challenge_context(
+        api_base=api_base,
+        challenge_id=challenge_id,
+        area=area,
+        arena_api_key=arena_api_key,
+    )
 
-    By default this returns the baseline ENTSO-E payload. If a local
-    custom_model.py exists, it can either:
-    - define build_payload(...) for a full override, or
-    - define transform_payload(payload=..., ...) to modify the baseline payload
-    """
     custom_model = _load_custom_model_module()
     custom_build_payload = (
         getattr(custom_model, "build_payload", None) if custom_model else None
     )
-    if callable(custom_build_payload):
-        custom_payload = custom_build_payload(
-            target_date=target_date,
-            challenge_id=challenge_id,
-            area=area,
-            entsoe_api_key=entsoe_api_key,
-            api_base=api_base,
-            include_quantiles=include_quantiles,
-            include_ensemble=include_ensemble,
-            tz_name=tz_name,
-        )
-        return _validate_payload(
-            custom_payload,
-            source="custom_model.build_payload",
-        )
+    hook_kwargs = {
+        "target_date": target_date,
+        "challenge_id": context.challenge_id,
+        "area": context.area,
+        "entsoe_api_key": entsoe_api_key,
+        "api_base": api_base,
+        "data_source": data_source,
+        "challenge_context": context,
+        "challenge_detail": context.challenge_detail,
+        "forecast_objective": context.forecast_objective,
+        "tz_name": context.reference_timezone or DEFAULT_TIMEZONE,
+    }
 
-    payload = build_payload_from_entsoe(
+    if callable(custom_build_payload):
+        custom_payload = _call_hook(custom_build_payload, **hook_kwargs)
+        return _validate_payload(custom_payload, source="custom_model.build_payload")
+
+    payload = build_payload_from_source(
         target_date=target_date,
-        challenge_id=challenge_id,
-        area=area,
+        context=context,
+        data_source=data_source,
         entsoe_api_key=entsoe_api_key,
-        api_base=api_base,
-        include_quantiles=include_quantiles,
-        include_ensemble=include_ensemble,
-        tz_name=tz_name,
     )
 
     custom_transform_payload = (
         getattr(custom_model, "transform_payload", None) if custom_model else None
     )
     if callable(custom_transform_payload):
-        transformed_payload = custom_transform_payload(
+        transformed_payload = _call_hook(
+            custom_transform_payload,
             payload=payload,
-            target_date=target_date,
-            challenge_id=challenge_id,
-            area=area,
-            entsoe_api_key=entsoe_api_key,
-            api_base=api_base,
-            include_quantiles=include_quantiles,
-            include_ensemble=include_ensemble,
-            tz_name=tz_name,
+            **hook_kwargs,
         )
         return _validate_payload(
             transformed_payload,
@@ -728,11 +987,8 @@ def submit(
     verbose: bool = True,
     print_payload_on_dry_run: bool = True,
 ) -> bool:
-    """POST payload to the Arena submissions API. Returns True on success."""
     if dry_run:
         if verbose and print_payload_on_dry_run:
-            import json
-
             print("Payload (dry run):")
             print(json.dumps(payload, indent=2))
         elif verbose:
@@ -772,18 +1028,17 @@ def submit(
 
         return str(body).strip()
 
-    _TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
-    _RETRY_DELAYS = [5, 15, 30]  # seconds between attempts 1→2, 2→3, 3→4
-
+    transient_status_codes = {429, 502, 503, 504}
+    retry_delays = [5, 15, 30]
     url = f"{api_base.rstrip('/')}/api/v1/submissions"
     headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
 
     last_message = ""
-    for attempt, delay in enumerate([0] + _RETRY_DELAYS, start=1):
+    for attempt, delay in enumerate([0] + retry_delays, start=1):
         if delay:
             if verbose:
                 print(
-                    f"  Retrying in {delay}s (attempt {attempt}/{1 + len(_RETRY_DELAYS)})..."
+                    f"  Retrying in {delay}s (attempt {attempt}/{1 + len(retry_delays)})..."
                 )
             time.sleep(delay)
         try:
@@ -798,15 +1053,12 @@ def submit(
             last_message = f"HTTP {resp.status_code}" + (
                 f" - {detail}" if detail else ""
             )
-
-            if resp.status_code not in _TRANSIENT_STATUS_CODES:
-                break  # permanent error, no point retrying
-
+            if resp.status_code not in transient_status_codes:
+                break
             if verbose:
                 print(f"  Transient error: {last_message}", file=sys.stderr)
-
-        except requests.RequestException as e:
-            last_message = str(e)
+        except requests.RequestException as exc:
+            last_message = str(exc)
             if verbose:
                 print(f"  Connection error: {last_message}", file=sys.stderr)
 
@@ -818,27 +1070,25 @@ def submit(
 def main() -> None:
     local_env = _load_local_env_values()
     parser = argparse.ArgumentParser(
-        description="Submit a day-ahead forecast to the Energy Arena."
+        description="Submit one forecast to the Energy Arena."
     )
     parser.add_argument(
         "--target_date",
         type=str,
         default=None,
-        help="Target day in DD-MM-YYYY (e.g. 21-02-2026). Required unless --list_open_challenges or --check_setup is used.",
+        help="Target day in DD-MM-YYYY. Required unless --list_open_challenges or --check_setup is used.",
     )
     parser.add_argument(
         "--challenge_id",
         type=str,
-        default="day_ahead_price",
-        choices=list(CHALLENGE_ENTSOE),
-        help="Challenge code (default: day_ahead_price).",
+        default="",
+        help="Challenge id from python submit_forecast.py --list_open_challenges.",
     )
     parser.add_argument(
         "--area",
         type=str,
-        default="DE_LU",
-        choices=ALLOWED_AREAS,
-        help="Bidding zone (default: DE_LU).",
+        default="",
+        help="Optional area override. Current challenges usually have exactly one area and do not need this.",
     )
     parser.add_argument(
         "--api_key",
@@ -852,9 +1102,16 @@ def main() -> None:
         default=(
             local_env.get("ARENA_API_BASE_URL", "")
             or os.environ.get("ARENA_API_BASE_URL", "")
-            or "https://api.energy-arena.org"
+            or DEFAULT_API_BASE
         ).strip(),
         help="Arena API base URL.",
+    )
+    parser.add_argument(
+        "--data_source",
+        type=str,
+        default=_get_default_data_source(local_env),
+        choices=sorted(SUPPORTED_DATA_SOURCES),
+        help="Baseline source for the built-in forecast generator (default: smard).",
     )
     parser.add_argument(
         "--use_global_env",
@@ -880,25 +1137,33 @@ def main() -> None:
     parser.add_argument(
         "--list_open_challenges",
         action="store_true",
-        help="Fetch open challenge metadata from the Energy Arena API and exit.",
+        help="Fetch currently open challenges from the Energy Arena API and exit.",
     )
     parser.add_argument(
         "--include_quantiles",
         action="store_true",
-        help="Append quantiles estimated from historical analog values.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--include_ensemble",
         action="store_true",
-        help="Append quantiles plus ensemble members estimated from historical analog values.",
+        help=argparse.SUPPRESS,
     )
     args = parser.parse_args()
 
+    data_source = _normalized_data_source(args.data_source)
     entsoe_key = local_env.get("ENTSOE_API_KEY", "").strip()
     arena_key = (args.api_key or "").strip()
     if args.use_global_env:
         entsoe_key = entsoe_key or os.environ.get("ENTSOE_API_KEY", "").strip()
         arena_key = arena_key or os.environ.get("ARENA_API_KEY", "").strip()
+
+    if args.include_quantiles or args.include_ensemble:
+        print(
+            "Warning: --include_quantiles and --include_ensemble are ignored. "
+            "The payload format is derived directly from the selected challenge.",
+            file=sys.stderr,
+        )
 
     if args.check_setup:
         sys.exit(
@@ -906,6 +1171,7 @@ def main() -> None:
                 entsoe_key=entsoe_key,
                 arena_key=arena_key,
                 api_base=args.api_base,
+                data_source=data_source,
             )
         )
 
@@ -915,23 +1181,33 @@ def main() -> None:
                 args.api_base,
                 arena_api_key=arena_key or None,
             )
-        except Exception as e:
-            print(f"Error: {type(e).__name__}: {e}", file=sys.stderr)
+        except Exception as exc:
+            print(f"Error: {type(exc).__name__}: {exc}", file=sys.stderr)
             sys.exit(1)
-        print_open_challenge_infos(challenge_infos)
+        print_open_challenge_infos(
+            challenge_infos,
+            api_base=args.api_base,
+            arena_api_key=arena_key or None,
+        )
         return
 
-    if not entsoe_key:
-        print(
-            "Error: ENTSOE_API_KEY must be set in local .env "
-            "(or use --use_global_env). Run --check_setup for a quick diagnosis.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
     if not arena_key and not args.dry_run:
         print(
             "Error: Arena API key required. Set ARENA_API_KEY in local .env, "
             "pass --api_key, or use --use_global_env. Run --check_setup for a quick diagnosis.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if data_source == "entsoe" and not entsoe_key:
+        print(
+            "Error: ENTSOE_API_KEY is required for --data_source entsoe. "
+            "Switch to --data_source smard for the default keyless workflow.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if not args.challenge_id:
+        print(
+            "Error: --challenge_id is required unless --list_open_challenges or --check_setup is used.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -944,24 +1220,34 @@ def main() -> None:
 
     try:
         target_date = parse_target_date(args.target_date)
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    lookback = int(CHALLENGE_ENTSOE[args.challenge_id]["point_lookback_days"])
-    probabilistic_mode = []
-    if args.include_quantiles or args.include_ensemble:
-        probabilistic_mode.append("quantiles")
-    if args.include_ensemble:
-        probabilistic_mode.append("ensemble")
-    mode_suffix = (
-        " | probabilistic: " + ", ".join(probabilistic_mode)
-        if probabilistic_mode
-        else ""
-    )
+    try:
+        context = _resolve_challenge_context(
+            api_base=args.api_base,
+            challenge_id=args.challenge_id,
+            area=args.area or None,
+            arena_api_key=arena_key or None,
+        )
+    except Exception as exc:
+        print(f"Error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if data_source == "smard" and context.smard_counterpart is None:
+        print(
+            f"Error: challenge {context.challenge_id} does not currently expose a confirmed "
+            "SMARD counterpart. Use --data_source entsoe if you want to build the baseline "
+            "via ENTSO-E instead.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     print(
-        f"Target date: {target_date} | challenge: {args.challenge_id} | area: {args.area} | "
-        f"ENTSO-E d-{lookback}{mode_suffix}"
+        f"Target date: {target_date} | challenge: {context.challenge_id} | "
+        f"target: {context.target_name} | area: {context.area} | "
+        f"format: {context.accepted_forecast_format} | source: {data_source}"
     )
 
     try:
@@ -969,47 +1255,40 @@ def main() -> None:
             args.api_base,
             arena_api_key=arena_key or None,
         )
-    except Exception as e:
+    except Exception as exc:
         print(
-            f"Warning: failed to fetch open challenge metadata: {e}",
+            f"Warning: failed to fetch open challenge metadata: {exc}",
             file=sys.stderr,
         )
     else:
-        current_info = active_lookup.get(args.challenge_id)
+        current_info = active_lookup.get(context.challenge_id)
         if current_info is None:
             print(
-                f"Warning: challenge '{args.challenge_id}' is not currently listed by /api/v1/challenges/open.",
+                f"Warning: challenge '{context.challenge_id}' is not currently listed by /api/v1/challenges/open.",
                 file=sys.stderr,
             )
         else:
-            active_areas = current_info.get("areas") or []
-            if args.area not in active_areas:
+            next_deadline = current_info.get("next_submission_deadline")
+            next_target_start = current_info.get("next_target_start")
+            if next_deadline and next_target_start:
                 print(
-                    f"Warning: area '{args.area}' is not currently listed for challenge '{args.challenge_id}'. "
-                    f"API areas: {active_areas}",
-                    file=sys.stderr,
+                    f"API metadata: next deadline {next_deadline} | next target start {next_target_start}"
                 )
-            else:
-                next_deadline = current_info.get("next_submission_deadline")
-                next_target_start = current_info.get("next_target_start")
-                if next_deadline and next_target_start:
-                    print(
-                        f"API metadata: next deadline {next_deadline} | next target start {next_target_start}"
-                    )
 
     try:
         payload = build_payload(
             target_date=target_date,
-            challenge_id=args.challenge_id,
-            area=args.area,
+            challenge_id=context.challenge_id,
+            area=context.area,
             entsoe_api_key=entsoe_key,
             api_base=args.api_base,
-            include_quantiles=args.include_quantiles,
-            include_ensemble=args.include_ensemble,
+            data_source=data_source,
+            arena_api_key=arena_key or None,
+            challenge_context=context,
         )
-    except Exception as e:
-        print(f"Error: {type(e).__name__}: {e}", file=sys.stderr)
-        if not str(e).strip():
+    except Exception as exc:
+        print(f"Error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        if not str(exc).strip():
             import traceback
 
             traceback.print_exc(file=sys.stderr)
@@ -1018,8 +1297,8 @@ def main() -> None:
     if args.save_payload:
         try:
             saved_path = save_payload_to_file(payload, args.save_payload)
-        except Exception as e:
-            print(f"Error: failed to save payload: {e}", file=sys.stderr)
+        except Exception as exc:
+            print(f"Error: failed to save payload: {exc}", file=sys.stderr)
             sys.exit(1)
         print(f"Saved payload to {saved_path}")
 

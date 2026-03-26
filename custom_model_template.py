@@ -5,8 +5,8 @@ submit_forecast.py and run_daily_submissions.py automatically load
 custom_model.py if it exists in the repository root.
 
 The incoming payload already has:
-- the correct challenge_id, area, and target_start
-- the correct target timestamps for the chosen day
+- the correct challenge_id
+- the correct target day anchor for the chosen challenge
 - the correct value shape for point / quantile / ensemble mode
 
 The safest way to integrate your own model is to replace only the forecast
@@ -26,8 +26,10 @@ def transform_payload(
     area: str,
     entsoe_api_key: str,
     api_base: str,
-    include_quantiles: bool,
-    include_ensemble: bool,
+    data_source: str,
+    challenge_context,
+    challenge_detail: dict,
+    forecast_objective: str,
     tz_name: str,
 ) -> dict:
     """
@@ -38,28 +40,30 @@ def transform_payload(
 
     Typical customization:
     - compute your own forecast values
-    - write those values into payload["points"][i]["value"]
+    - write those values into payload["values"][i]
     - keep the payload structure unchanged
     """
-    del target_date, challenge_id, area, entsoe_api_key, api_base, tz_name
+    del (
+        target_date,
+        challenge_id,
+        area,
+        entsoe_api_key,
+        api_base,
+        data_source,
+        challenge_context,
+        challenge_detail,
+        forecast_objective,
+        tz_name,
+    )
 
-    for point in payload["points"]:
-        original_value = point["value"]
+    for index, original_value in enumerate(payload["values"]):
 
         # Replace this section with your own model output.
         # The current code is intentionally a no-op scaffold that preserves
         # the baseline payload shape.
         if isinstance(original_value, list):
-            point_forecast = float(original_value[0])
-            quantile_and_ensemble_values = [float(v) for v in original_value[1:]]
-
-            if include_ensemble:
-                point["value"] = [point_forecast, *quantile_and_ensemble_values]
-            elif include_quantiles:
-                point["value"] = [point_forecast, *quantile_and_ensemble_values]
-            else:
-                point["value"] = point_forecast
+            payload["values"][index] = [float(v) for v in original_value]
         else:
-            point["value"] = float(original_value)
+            payload["values"][index] = float(original_value)
 
     return payload

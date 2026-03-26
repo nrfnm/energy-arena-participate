@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Run daily submissions for all configured challenges and both areas.
+Run daily submissions for all currently open challenges.
 
 Default target date: tomorrow in Europe/Berlin, so running around 11:30 local
 time submits before the 12:00 deadline for day-ahead challenges.
@@ -15,47 +15,27 @@ from datetime import date, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-# Same directory as this script.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from challenge_catalog import get_challenge_infos  # noqa: E402
 from submit_forecast import (  # noqa: E402
-    ALLOWED_AREAS,
-    CHALLENGE_ENTSOE,
+    DEFAULT_API_BASE,
     build_payload,
+    parse_target_date,
     submit,
+    _get_default_data_source,
+    _load_env_file,
+    _normalized_data_source,
 )
 
 TZ_NAME = "Europe/Berlin"
 
 
 def tomorrow_cet() -> date:
-    """Tomorrow's date in Europe/Berlin."""
     from datetime import datetime
 
     tz = ZoneInfo(TZ_NAME)
-    now = datetime.now(tz).date()
-    return now + timedelta(days=1)
-
-
-def target_date_to_dd_mm_yyyy(d: date) -> str:
-    """Format date as DD-MM-YYYY."""
-    return d.strftime("%d-%m-%Y")
-
-
-def _load_env_file(path: Path) -> dict:
-    if not path.exists() or not path.is_file():
-        return {}
-    values = {}
-    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key:
-            values[key] = value
-    return values
+    return datetime.now(tz).date() + timedelta(days=1)
 
 
 def _load_local_env_values() -> dict:
@@ -64,14 +44,28 @@ def _load_local_env_values() -> dict:
 
 
 def main() -> None:
+    local_env = _load_local_env_values()
     parser = argparse.ArgumentParser(
-        description="Submit forecasts for all challenges and areas."
+        description="Submit forecasts for all currently open challenges."
     )
     parser.add_argument(
         "--target_date",
         type=str,
         default=None,
         help="Target day DD-MM-YYYY (default: tomorrow in Europe/Berlin).",
+    )
+    parser.add_argument(
+        "--data_source",
+        type=str,
+        default=_get_default_data_source(local_env),
+        choices=["entsoe", "smard"],
+        help="Baseline source for the built-in forecast generator (default: smard).",
+    )
+    parser.add_argument(
+        "--challenge_id",
+        action="append",
+        default=[],
+        help="Optional challenge id filter. Pass multiple times to limit the batch.",
     )
     parser.add_argument(
         "--dry_run",
@@ -86,32 +80,38 @@ def main() -> None:
     parser.add_argument(
         "--include_quantiles",
         action="store_true",
-        help="Append quantiles estimated from historical analog values.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--include_ensemble",
         action="store_true",
-        help="Append quantiles plus ensemble members estimated from historical analog values.",
+        help=argparse.SUPPRESS,
     )
     args = parser.parse_args()
 
-    local_env = _load_local_env_values()
+    if args.include_quantiles or args.include_ensemble:
+        print(
+            "Warning: --include_quantiles and --include_ensemble are ignored. "
+            "Each challenge now defines its own forecast objective.",
+            file=sys.stderr,
+        )
+
+    data_source = _normalized_data_source(args.data_source)
     entsoe_key = local_env.get("ENTSOE_API_KEY", "").strip()
     arena_key = local_env.get("ARENA_API_KEY", "").strip()
     api_base = (
         local_env.get("ARENA_API_BASE_URL", "")
         or os.environ.get("ARENA_API_BASE_URL", "")
-        or "https://api.energy-arena.org"
+        or DEFAULT_API_BASE
     ).strip()
 
     if args.use_global_env:
         entsoe_key = entsoe_key or os.environ.get("ENTSOE_API_KEY", "").strip()
         arena_key = arena_key or os.environ.get("ARENA_API_KEY", "").strip()
 
-    if not entsoe_key:
+    if data_source == "entsoe" and not entsoe_key:
         print(
-            "Error: ENTSOE_API_KEY must be set in local .env "
-            "(or use --use_global_env).",
+            "Error: ENTSOE_API_KEY is required for --data_source entsoe.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -124,26 +124,41 @@ def main() -> None:
         sys.exit(1)
 
     if args.target_date:
-        parts = args.target_date.strip().split("-")
-        if len(parts) != 3:
-            print("Error: --target_date must be DD-MM-YYYY.", file=sys.stderr)
+        try:
+            target_date = parse_target_date(args.target_date)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
-        day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
-        target_date = date(year, month, day)
     else:
         target_date = tomorrow_cet()
 
-    target_str = target_date_to_dd_mm_yyyy(target_date)
-    mode_bits = []
-    if args.include_quantiles or args.include_ensemble:
-        mode_bits.append("quantiles")
-    if args.include_ensemble:
-        mode_bits.append("ensemble")
-    mode_suffix = f" | probabilistic: {', '.join(mode_bits)}" if mode_bits else ""
+    try:
+        challenge_infos = get_challenge_infos(api_base, arena_api_key=arena_key or None)
+    except Exception as exc:
+        print(f"Error: failed to fetch open challenges: {exc}", file=sys.stderr)
+        sys.exit(1)
 
+    active_entries = [
+        entry
+        for entry in (challenge_infos.get("active_challenges") or [])
+        if isinstance(entry, dict) and str(entry.get("challenge_id") or "").strip()
+    ]
+    requested_ids = {str(item).strip() for item in args.challenge_id if str(item).strip()}
+    if requested_ids:
+        active_entries = [
+            entry
+            for entry in active_entries
+            if str(entry.get("challenge_id") or "").strip() in requested_ids
+        ]
+
+    if not active_entries:
+        print("No matching open challenges found.")
+        return
+
+    challenge_ids = [str(entry.get("challenge_id") or "").strip() for entry in active_entries]
     print(
-        f"Target date: {target_date} ({target_str}) | challenges: {list(CHALLENGE_ENTSOE)} "
-        f"| areas: {ALLOWED_AREAS}{mode_suffix}"
+        f"Target date: {target_date} | source: {data_source} | "
+        f"challenges: {challenge_ids}"
     )
     if args.dry_run:
         print("dry_run: no submissions will be sent.")
@@ -151,32 +166,34 @@ def main() -> None:
 
     ok_count = 0
     fail_count = 0
-    for challenge_id in CHALLENGE_ENTSOE:
-        for area in ALLOWED_AREAS:
-            try:
-                payload = build_payload(
-                    target_date=target_date,
-                    challenge_id=challenge_id,
-                    area=area,
-                    entsoe_api_key=entsoe_key,
-                    api_base=api_base,
-                    include_quantiles=args.include_quantiles,
-                    include_ensemble=args.include_ensemble,
-                )
-                ok = submit(
-                    payload=payload,
-                    api_key=arena_key,
-                    api_base=api_base,
-                    dry_run=args.dry_run,
-                    verbose=True,
-                )
-                if ok:
-                    ok_count += 1
-                else:
-                    fail_count += 1
-            except Exception as e:
-                print(f"  FAIL {challenge_id} {area}: {e}", file=sys.stderr)
+    for entry in active_entries:
+        challenge_id = str(entry.get("challenge_id") or "").strip()
+        areas = [str(area).strip() for area in (entry.get("areas") or []) if str(area).strip()]
+        area = areas[0] if areas else None
+        try:
+            payload = build_payload(
+                target_date=target_date,
+                challenge_id=challenge_id,
+                area=area,
+                entsoe_api_key=entsoe_key,
+                api_base=api_base,
+                data_source=data_source,
+                arena_api_key=arena_key or None,
+            )
+            ok = submit(
+                payload=payload,
+                api_key=arena_key,
+                api_base=api_base,
+                dry_run=args.dry_run,
+                verbose=True,
+            )
+            if ok:
+                ok_count += 1
+            else:
                 fail_count += 1
+        except Exception as exc:
+            print(f"  FAIL {challenge_id}: {exc}", file=sys.stderr)
+            fail_count += 1
 
     print()
     print(f"Done: {ok_count} ok, {fail_count} failed (total {ok_count + fail_count})")

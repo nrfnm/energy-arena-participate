@@ -1,12 +1,13 @@
-# Windows Task Scheduler setup (11:30 CET)
+# Windows Task Scheduler setup
 
-This config runs daily submissions at **11:30 CET** for all 4 challenges and 2 areas.
+This runs daily submissions at **11:30 CET/CEST** for all currently open
+challenges.
 
 ## Prerequisites
 
-- Python installed (`python` works in terminal)
-- Repo dependencies installed: `pip install -r requirements.txt`
-- Local `.env` created in repo folder:
+- Python installed
+- `pip install -r requirements.txt`
+- local `.env` created in the repo folder
 
 ```bash
 copy .env.example .env
@@ -14,12 +15,10 @@ copy .env.example .env
 
 Fill in:
 
-- `ENTSOE_API_KEY`
 - `ARENA_API_KEY`
 - optional `ARENA_API_BASE_URL`
-
-The scripts read local `.env` automatically.  
-Global env vars are optional fallback only (`--use_global_env`).
+- optional `BASELINE_DATA_SOURCE=smard|entsoe`
+- optional `ENTSOE_API_KEY` only for `entsoe`
 
 ## Step 1: Open Task Scheduler
 
@@ -30,8 +29,7 @@ Global env vars are optional fallback only (`--use_global_env`).
 ## Step 2: General tab
 
 - Name: `Energy Arena daily submissions`
-- Choose whether task runs only when logged on or also when logged off
-- Keep defaults unless your environment needs custom settings
+- Choose whether the task runs only when logged on or also when logged off
 
 ## Step 3: Trigger
 
@@ -40,11 +38,10 @@ Global env vars are optional fallback only (`--use_global_env`).
 3. Time: **11:30:00**
 4. Repeat every: 1 day
 
-If machine timezone is not CET/CEST, set local time equivalent to 11:30 CET.
+## Step 4: Action
 
-## Step 4: Action (recommended)
+Recommended:
 
-- Action: Start a program
 - Program/script: `C:\path\to\energy-arena-participate\run_daily_submissions.bat`
 - Start in: `C:\path\to\energy-arena-participate`
 
@@ -54,21 +51,13 @@ Alternative:
 - Add arguments: `run_daily_submissions.py`
 - Start in: `C:\path\to\energy-arena-participate`
 
-Optional probabilistic mode:
+Optional ENTSO-E mode:
 
-- Add arguments: `run_daily_submissions.py --include_quantiles`
-- or: `run_daily_submissions.py --include_ensemble`
+- Add arguments: `run_daily_submissions.py --data_source entsoe`
 
 ## Step 5: Save and test
 
-1. Save task
-2. Right-click task → **Run**
-3. Confirm successful run in Task Scheduler history / result code
-4. Check Arena submissions for expected target day
-
-## Quick summary
-
-- Schedule: Daily 11:30 CET
-- Action: `run_daily_submissions.bat` (or `python run_daily_submissions.py`)
-- Start-in: repo folder
-- Keys: local `.env` in repo
+1. Save the task
+2. Right-click the task and choose **Run**
+3. Confirm a successful run in Task Scheduler history
+4. Check the Energy Arena dashboard for resulting submissions

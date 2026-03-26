@@ -69,3 +69,48 @@ def get_active_challenge_lookup(
         if isinstance(challenge_id, str) and challenge_id:
             lookup[challenge_id] = entry
     return lookup
+
+
+def get_challenge_detail(
+    api_base: str,
+    challenge_id: str,
+    arena_api_key: str | None = None,
+) -> Dict[str, Any]:
+    """
+    Fetch full challenge metadata for one challenge id.
+
+    The endpoint is public, but an Arena API key may still be passed for
+    consistency with other helpers.
+    """
+    url = f"{api_base.rstrip('/')}/api/v1/challenges/{str(challenge_id).strip()}"
+    api_key = (arena_api_key or "").strip()
+    headers = {"X-API-Key": api_key} if api_key else None
+
+    try:
+        response = requests.get(url, headers=headers, timeout=20)
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Failed to fetch challenge detail for {challenge_id}: {exc}"
+        ) from exc
+
+    if not response.ok:
+        detail = response.text.strip()
+        message = f"HTTP {response.status_code}"
+        if detail:
+            message = f"{message} - {detail}"
+        raise RuntimeError(
+            f"Failed to fetch challenge detail for {challenge_id}: {message}"
+        )
+
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Challenge detail endpoint returned invalid JSON for {challenge_id}."
+        ) from exc
+
+    if not isinstance(body, dict):
+        raise RuntimeError(
+            f"Challenge detail endpoint returned an unexpected payload for {challenge_id}."
+        )
+    return body

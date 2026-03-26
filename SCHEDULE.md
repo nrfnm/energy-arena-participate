@@ -1,11 +1,11 @@
 # Scheduling daily submissions at 11:30 CET
 
-Run one of the following every day at **11:30 CET** (before 12:00 deadline for the target day):
+Run one of the following every day at **11:30 CET/CEST**:
 
 - **Windows:** Task Scheduler with `run_daily_submissions.bat` or `run_daily_submissions.ps1`
 - **Linux/macOS:** cron with `run_daily_submissions.py`
 
-## Key handling (recommended)
+## Key handling
 
 Use a local `.env` file in this repo:
 
@@ -15,39 +15,37 @@ cp .env.example .env
 
 Set:
 
-- `ENTSOE_API_KEY`
 - `ARENA_API_KEY`
 - optional `ARENA_API_BASE_URL`
+- optional `BASELINE_DATA_SOURCE=smard|entsoe`
+- optional `ENTSOE_API_KEY` only for `entsoe`
 
 `run_daily_submissions.py` and `submit_forecast.py` read `.env` automatically.
-Global env vars for API keys are ignored by default; enable fallback with `--use_global_env`.
+Global env vars for API keys are ignored by default; enable fallback with
+`--use_global_env`.
 
----
-
-## Windows (Task Scheduler)
+## Windows
 
 1. Open `taskschd.msc`
-2. Create Task (not Basic Task)
-3. Trigger: Daily at 11:30 (CET)
+2. Create Task
+3. Trigger: Daily at 11:30
 4. Action:
    - Program/script: `C:\path\to\energy-arena-participate\run_daily_submissions.bat`
    - Start in: `C:\path\to\energy-arena-participate`
-5. Save and run once manually to test
+5. Save and run once manually
 
-Alternative action:
+Alternative:
 
 - Program/script: `python`
 - Arguments: `run_daily_submissions.py`
 - Start in: `C:\path\to\energy-arena-participate`
 
-Optional probabilistic modes:
+Optional:
 
-- `run_daily_submissions.py --include_quantiles`
-- `run_daily_submissions.py --include_ensemble`
+- `run_daily_submissions.py --data_source entsoe`
+- `run_daily_submissions.py --challenge_id 1`
 
----
-
-## Linux/macOS (cron)
+## Linux/macOS
 
 1. Open crontab: `crontab -e`
 2. Add:
@@ -56,24 +54,13 @@ Optional probabilistic modes:
 30 11 * * * cd /path/to/energy-arena-participate && /usr/bin/python3 run_daily_submissions.py
 ```
 
-Replace `/path/to/energy-arena-participate` and `/usr/bin/python3` with your paths.
-
 If you intentionally want global env fallback, add `--use_global_env`.
 
-If you want probabilistic submissions, append `--include_quantiles` or
-`--include_ensemble`.
+If you want ENTSO-E instead of the default SMARD baseline, append
+`--data_source entsoe`.
 
----
-
-## Optional dry run
+## Dry run
 
 ```bash
 python run_daily_submissions.py --dry_run
-```
-
-Probabilistic dry runs:
-
-```bash
-python run_daily_submissions.py --include_quantiles --dry_run
-python run_daily_submissions.py --include_ensemble --dry_run
 ```
