@@ -1044,9 +1044,20 @@ def submit(
         try:
             resp = requests.post(url, json=payload, headers=headers, timeout=30)
             if resp.ok:
+                data = resp.json()
                 if verbose:
-                    data = resp.json()
                     print(f"OK -> submission_id={data.get('submission_id')}")
+                    submission_ids = data.get("submission_ids") or []
+                    if len(submission_ids) > 1:
+                        print(f"Created submission_ids={submission_ids}")
+                    legacy_warning = data.get("legacy_compat_warning")
+                    if legacy_warning:
+                        print(f"Legacy compatibility warning: {legacy_warning}")
+                    elif data.get("legacy_compat_mode"):
+                        print(
+                            "Legacy compatibility warning: legacy bundled challenge ids "
+                            "are only accepted temporarily and will stop working soon."
+                        )
                 return True
 
             detail = _extract_error_detail(resp)
