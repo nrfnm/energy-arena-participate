@@ -7,6 +7,11 @@ The starter workflow has only two manual steps:
 
 If you want to use your own model, change only the payload-generation step.
 
+The repository now exposes two explicit helper modules for that:
+
+- `data_loaders.py` for historical source-data loading
+- `starter_model.py` for the built-in starter baseline
+
 ## Recommended integration point
 
 1. Copy `custom_model_template.py` to `custom_model.py`
@@ -15,6 +20,27 @@ If you want to use your own model, change only the payload-generation step.
 `run_forecast_model.py` and `run_daily_submissions.py` automatically load `custom_model.py` if it exists.
 
 `submit_forecast_to_energy_arena.py` only sends the saved payload and does not modify it.
+
+## Available building blocks
+
+### `data_loaders.py`
+
+Reusable loader functions:
+
+- `load_smard_series(...)`
+- `load_entsoe_series(...)`
+- `load_source_series(...)`
+
+These let students keep the same upstream data-loading logic while replacing
+only the forecasting step.
+
+### `starter_model.py`
+
+Reusable starter baseline:
+
+- `build_starter_payload(...)`
+
+This is the current naive historical baseline used by the starter flow.
 
 ## Recommended procedure
 

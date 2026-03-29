@@ -8,6 +8,12 @@ As a participant, you only need these scripts:
 - `submit_forecast_to_energy_arena.py`
 - `run_daily_submissions.py`
 
+If you want to use the repository as a basis for your own model, these helper
+modules are also relevant:
+
+- `data_loaders.py`
+- `starter_model.py`
+
 Everything else is internal support code or documentation.
 
 ## First submission
@@ -102,6 +108,27 @@ Use this to send a saved payload.
 Use this only after one manual submission already works.
 
 It submits all currently open challenges automatically.
+
+## Helper modules for your own model
+
+### `data_loaders.py`
+
+Provides reusable loader functions:
+
+- `load_smard_series(...)`
+- `load_entsoe_series(...)`
+- `load_source_series(...)`
+
+These are the functions students can import if they want to build their own
+model on top of the same data sources.
+
+### `starter_model.py`
+
+Provides:
+
+- `build_starter_payload(...)`
+
+This is the built-in baseline model logic used by the starter flow.
 
 ## Integrate your own model
 

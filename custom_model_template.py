@@ -11,6 +11,9 @@ The incoming payload already has:
 
 The safest way to integrate your own model is to replace only the forecast
 values and return the payload.
+
+If you want to reuse the repository's source-data logic, you can import helper
+functions from data_loaders.py inside custom_model.py.
 """
 
 from __future__ import annotations
