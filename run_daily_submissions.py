@@ -17,8 +17,8 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from challenge_catalog import get_challenge_infos  # noqa: E402
-from submit_forecast import (  # noqa: E402
+from _challenge_catalog import get_challenge_infos  # noqa: E402
+from _starter_core import (  # noqa: E402
     DEFAULT_API_BASE,
     build_payload,
     parse_target_date,

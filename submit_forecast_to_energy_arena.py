@@ -11,7 +11,7 @@ import os
 import sys
 from pathlib import Path
 
-from submit_forecast import (
+from _starter_core import (
     DEFAULT_API_BASE,
     _load_local_env_values,
     _validate_payload,

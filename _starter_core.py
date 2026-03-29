@@ -37,7 +37,7 @@ import pandas as pd
 import requests
 from entsoe import EntsoePandasClient
 
-from challenge_catalog import (
+from _challenge_catalog import (
     get_active_challenge_lookup,
     get_challenge_detail,
     get_challenge_infos,

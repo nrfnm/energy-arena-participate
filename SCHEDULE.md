@@ -20,7 +20,8 @@ Set:
 - optional `BASELINE_DATA_SOURCE=smard|entsoe`
 - optional `ENTSOE_API_KEY` only for `entsoe`
 
-`run_daily_submissions.py` and `submit_forecast.py` read `.env` automatically.
+`run_daily_submissions.py`, `run_forecast_model.py`, and
+`submit_forecast_to_energy_arena.py` read `.env` automatically.
 Global env vars for API keys are ignored by default; enable fallback with
 `--use_global_env`.
 

@@ -15,8 +15,8 @@ import argparse
 import os
 import sys
 
-from challenge_catalog import get_challenge_infos
-from submit_forecast import (
+from _challenge_catalog import get_challenge_infos
+from _starter_core import (
     DEFAULT_API_BASE,
     _get_default_data_source,
     _load_local_env_values,
