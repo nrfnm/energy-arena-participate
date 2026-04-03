@@ -14,8 +14,23 @@ $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $logPath = Join-Path $logDir "run_daily_submissions_$timestamp.log"
 $latestLogPath = Join-Path $logDir "run_daily_submissions_latest.log"
 
+function Quote-CmdArg {
+    param([string]$Value)
+
+    if ($null -eq $Value) {
+        return '""'
+    }
+    if ($Value -match '[\s"&^|<>]') {
+        return '"' + ($Value -replace '"', '\"') + '"'
+    }
+    return $Value
+}
+
+$commandParts = @("python", "-u", "run_daily_submissions.py") + $args
+$cmdLine = (($commandParts | ForEach-Object { Quote-CmdArg $_ }) -join " ") + " 2>&1"
+
 Write-Host "Writing log to $logPath"
-& python run_daily_submissions.py @args 2>&1 | Tee-Object -FilePath $logPath
+& cmd.exe /d /c $cmdLine | Tee-Object -FilePath $logPath
 $exitCode = if ($null -ne $LASTEXITCODE) { [int]$LASTEXITCODE } else { 0 }
 
 Copy-Item -Path $logPath -Destination $latestLogPath -Force

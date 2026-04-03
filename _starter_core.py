@@ -747,6 +747,108 @@ def _series_to_shifted_points(
     return points
 
 
+def _resolution_step_from_context(
+    *,
+    context: ChallengeContext,
+    series: pd.Series,
+    data_source: str,
+) -> timedelta | None:
+    if data_source == "smard" and context.smard_counterpart is not None:
+        resolution = str(context.smard_counterpart.resolution or "").strip().lower()
+        if resolution == "quarterhour":
+            return timedelta(minutes=15)
+        if resolution == "halfhour":
+            return timedelta(minutes=30)
+        if resolution in {"hour", "hourly"}:
+            return timedelta(hours=1)
+
+    if len(series.index) < 2:
+        return None
+
+    positive_deltas = []
+    previous = None
+    for ts in series.index.sort_values():
+        current = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+        if previous is not None:
+            delta = current - previous
+            if delta > timedelta(0):
+                positive_deltas.append(delta)
+        previous = current
+
+    if not positive_deltas:
+        return None
+    return min(positive_deltas)
+
+
+def _resolution_label(step: timedelta | None) -> str:
+    if step is None:
+        return "time-step"
+    if step == timedelta(minutes=15):
+        return "quarter-hour"
+    if step == timedelta(minutes=30):
+        return "half-hour"
+    if step == timedelta(hours=1):
+        return "hourly"
+    minutes = step.total_seconds() / 60.0
+    if minutes.is_integer():
+        return f"{int(minutes)}-minute"
+    return f"{minutes:g}-minute"
+
+
+def _validate_series_point_count(
+    *,
+    context: ChallengeContext,
+    series: pd.Series,
+    data_source: str,
+    delivery_date: date,
+    target_date: date,
+) -> None:
+    if context.target_period_type.lower() != "calendar_day":
+        return
+
+    step = _resolution_step_from_context(
+        context=context,
+        series=series,
+        data_source=data_source,
+    )
+    if step is None:
+        return
+
+    tz_name = context.target_period_timezone or context.reference_timezone or DEFAULT_TIMEZONE
+    tz = ZoneInfo(tz_name)
+    target_start = datetime(
+        target_date.year,
+        target_date.month,
+        target_date.day,
+        0,
+        0,
+        0,
+        tzinfo=tz,
+    )
+    target_end = target_start + timedelta(days=1)
+    total_seconds = (
+        target_end.astimezone(timezone.utc) - target_start.astimezone(timezone.utc)
+    ).total_seconds()
+    step_seconds = step.total_seconds()
+    if step_seconds <= 0:
+        return
+
+    expected_count = int(round(total_seconds / step_seconds))
+    actual_count = len(series)
+    if actual_count == expected_count:
+        return
+
+    source_label = "SMARD" if data_source == "smard" else "ENTSO-E"
+    resolution_label = _resolution_label(step)
+    raise RuntimeError(
+        f"Incomplete {source_label} data for challenge {context.challenge_id}/{context.area}: "
+        f"got {actual_count} {resolution_label} values for source day {delivery_date}, "
+        f"but target_date {target_date} in timezone {tz_name} requires {expected_count}. "
+        "This usually means the source day has not been fully published yet. "
+        "Run again later or at the scheduled submission time."
+    )
+
+
 def collect_probabilistic_history_samples(
     *,
     target_date: date,
@@ -866,6 +968,13 @@ def build_payload_from_source(
             f"No {source_label} data for {context.target_code}/{context.area} "
             f"on {delivery_date} (d-{lookback_days}). Data may not be published yet."
         )
+    _validate_series_point_count(
+        context=context,
+        series=series,
+        data_source=data_source,
+        delivery_date=delivery_date,
+        target_date=target_date,
+    )
 
     points = _series_to_shifted_points(
         series,
