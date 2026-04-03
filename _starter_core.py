@@ -297,6 +297,22 @@ def print_open_challenge_infos(
     )
     rows: List[tuple[str, str, str, str, str, str]] = []
 
+    def _format_sort_rank(forecast_format: str) -> tuple[int, str]:
+        text = str(forecast_format or "").strip().lower()
+        if text == "point":
+            return (0, text)
+        if text.startswith("[q"):
+            return (1, text)
+        if text.startswith("[e"):
+            return (2, text)
+        return (3, text)
+
+    def _challenge_id_sort_key(challenge_id: str) -> tuple[int, str]:
+        text = str(challenge_id or "").strip()
+        if text.isdigit():
+            return (0, f"{int(text):09d}")
+        return (1, text.lower())
+
     for entry in active:
         if not isinstance(entry, dict):
             continue
@@ -323,6 +339,15 @@ def print_open_challenge_infos(
                 target_start,
             )
         )
+
+    rows.sort(
+        key=lambda row: (
+            str(row[1]).lower(),
+            str(row[2]).lower(),
+            _format_sort_rank(str(row[3])),
+            _challenge_id_sort_key(str(row[0])),
+        )
+    )
 
     widths = [
         max(len(header), *(len(row[idx]) for row in rows))
