@@ -2,8 +2,8 @@
 """
 Run daily submissions for all currently open challenges.
 
-Default target date: tomorrow in Europe/Berlin, so running around 11:30 local
-time submits before the 12:00 deadline for day-ahead challenges.
+Default target date: each selected challenge's next_target_start from the open
+challenge API response.
 """
 
 from __future__ import annotations
@@ -11,36 +11,62 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from _challenge_catalog import get_challenge_infos  # noqa: E402
+from _challenge_catalog import (  # noqa: E402
+    get_challenge_infos,
+    resolve_target_date_from_entry,
+)
 from _starter_core import (  # noqa: E402
     DEFAULT_API_BASE,
-    build_payload,
-    parse_target_date,
-    submit,
     _get_default_data_source,
     _load_env_file,
     _normalized_data_source,
+    build_payload,
+    parse_target_date,
+    save_payload_to_file,
+    submit,
 )
-
-TZ_NAME = "Europe/Berlin"
-
-
-def tomorrow_cet() -> date:
-    from datetime import datetime
-
-    tz = ZoneInfo(TZ_NAME)
-    return datetime.now(tz).date() + timedelta(days=1)
 
 
 def _load_local_env_values() -> dict:
     repo_root = Path(__file__).resolve().parent
     return _load_env_file(repo_root / ".env")
+
+
+def _payload_archive_root() -> Path:
+    return Path(__file__).resolve().parent / "submitted_payloads"
+
+
+def _safe_name_fragment(raw: str | None) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in text)
+
+
+def _archive_payload(
+    *,
+    payload: dict,
+    challenge_id: str,
+    area: str | None,
+    target_date: date,
+    dry_run: bool,
+) -> Path:
+    archive_root = _payload_archive_root()
+    challenge_dir = archive_root / f"challenge_{_safe_name_fragment(challenge_id)}"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    filename_parts = [timestamp, f"target_date_{target_date.isoformat()}"]
+    area_part = _safe_name_fragment(area)
+    if area_part:
+        filename_parts.append(f"area_{area_part}")
+    if dry_run:
+        filename_parts.append("dry_run")
+    filename = "__".join(filename_parts) + ".json"
+    return save_payload_to_file(payload, str(challenge_dir / filename))
 
 
 def main() -> None:
@@ -52,7 +78,10 @@ def main() -> None:
         "--target_date",
         type=str,
         default=None,
-        help="Target day DD-MM-YYYY (default: tomorrow in Europe/Berlin).",
+        help=(
+            "Target day DD-MM-YYYY. If omitted, each challenge uses its "
+            "next_target_start from the open challenge API."
+        ),
     )
     parser.add_argument(
         "--data_source",
@@ -123,14 +152,13 @@ def main() -> None:
         )
         sys.exit(1)
 
+    explicit_target_date: date | None = None
     if args.target_date:
         try:
-            target_date = parse_target_date(args.target_date)
+            explicit_target_date = parse_target_date(args.target_date)
         except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
-    else:
-        target_date = tomorrow_cet()
 
     try:
         challenge_infos = get_challenge_infos(api_base, arena_api_key=arena_key or None)
@@ -156,20 +184,66 @@ def main() -> None:
         return
 
     challenge_ids = [str(entry.get("challenge_id") or "").strip() for entry in active_entries]
-    print(
-        f"Target date: {target_date} | source: {data_source} | "
-        f"challenges: {challenge_ids}"
-    )
+    if explicit_target_date is not None:
+        print(
+            f"Target date override: {explicit_target_date} | source: {data_source} | "
+            f"challenges: {challenge_ids}"
+        )
+    else:
+        print(
+            "Target date default: per challenge from API next_target_start | "
+            f"source: {data_source} | challenges: {challenge_ids}"
+        )
     if args.dry_run:
         print("dry_run: no submissions will be sent.")
     print()
 
     ok_count = 0
     fail_count = 0
+    work_items: list[tuple[dict, date]] = []
     for entry in active_entries:
+        challenge_id = str(entry.get("challenge_id") or "").strip()
+        next_target_start = str(entry.get("next_target_start") or "").strip()
+        if explicit_target_date is not None:
+            target_date = explicit_target_date
+        else:
+            target_date = resolve_target_date_from_entry(entry)
+            if target_date is None:
+                print(
+                    "  FAIL "
+                    f"{challenge_id}: open challenge metadata does not expose a "
+                    "parseable next_target_start. Pass --target_date explicitly. "
+                    f"(next_target_start={next_target_start or '-'})",
+                    file=sys.stderr,
+                )
+                fail_count += 1
+                continue
+            print(
+                f"Challenge {challenge_id}: target_date={target_date} "
+                f"(next_target_start={next_target_start})"
+            )
+        work_items.append((entry, target_date))
+
+    if explicit_target_date is not None:
+        print(f"All selected challenges use target_date={explicit_target_date}")
+        print()
+    elif work_items:
+        print()
+
+    if not work_items:
+        print("No challenges with a usable target date were found.")
+        if fail_count and not args.dry_run:
+            sys.exit(1)
+        return
+
+    for entry, target_date in work_items:
         challenge_id = str(entry.get("challenge_id") or "").strip()
         areas = [str(area).strip() for area in (entry.get("areas") or []) if str(area).strip()]
         area = areas[0] if areas else None
+        print(
+            f"Running challenge {challenge_id} | area: {area or '-'} | "
+            f"target_date: {target_date}"
+        )
         try:
             payload = build_payload(
                 target_date=target_date,
@@ -180,6 +254,14 @@ def main() -> None:
                 data_source=data_source,
                 arena_api_key=arena_key or None,
             )
+            archive_path = _archive_payload(
+                payload=payload,
+                challenge_id=challenge_id,
+                area=area,
+                target_date=target_date,
+                dry_run=args.dry_run,
+            )
+            print(f"  Saved payload archive: {archive_path}")
             ok = submit(
                 payload=payload,
                 api_key=arena_key,
@@ -188,14 +270,16 @@ def main() -> None:
                 verbose=True,
             )
             if ok:
+                print(f"  RESULT {challenge_id}: ok")
                 ok_count += 1
             else:
+                print(f"  RESULT {challenge_id}: failed", file=sys.stderr)
                 fail_count += 1
         except Exception as exc:
             print(f"  FAIL {challenge_id}: {exc}", file=sys.stderr)
             fail_count += 1
+        print()
 
-    print()
     print(f"Done: {ok_count} ok, {fail_count} failed (total {ok_count + fail_count})")
     if fail_count and not args.dry_run:
         sys.exit(1)

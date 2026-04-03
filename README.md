@@ -60,6 +60,13 @@ This prints:
 python run_forecast_model.py --target_date 27-03-2026 --challenge_id 1 --save_payload test_payload.json
 ```
 
+If you omit `--target_date`, the script uses the selected challenge's
+`Next Target Start` date from `--list_open_challenges` automatically:
+
+```bash
+python run_forecast_model.py --challenge_id 1 --save_payload test_payload.json
+```
+
 What this does:
 
 - resolves the selected challenge
@@ -150,6 +157,12 @@ Detailed notes:
 python run_daily_submissions.py
 ```
 
+Without `--target_date`, each selected challenge uses its own
+`next_target_start` from the open challenge API.
+
+Each generated payload is also archived automatically under
+`.\submitted_payloads\challenge_<id>\`.
+
 Optional examples:
 
 ```bash
@@ -164,3 +177,9 @@ python run_daily_submissions.py --use_global_env
 
 - Windows: `WINDOWS_TASK_SCHEDULER.md`
 - Cross-platform notes: `SCHEDULE.md`
+
+The recommended Windows wrappers `run_daily_submissions.bat` and
+`run_daily_submissions.ps1` now write logs to `.\logs\`, including a timestamped
+file per run and `run_daily_submissions_latest.log`.
+Daily automation also archives the generated payload JSON files in
+`.\submitted_payloads\challenge_<id>\`.

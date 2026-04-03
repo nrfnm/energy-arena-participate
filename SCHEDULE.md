@@ -35,6 +35,10 @@ Global env vars for API keys are ignored by default; enable fallback with
    - Start in: `C:\path\to\energy-arena-participate`
 5. Save and run once manually
 
+The wrapper scripts write logs to `.\logs\run_daily_submissions_*.log` and
+refresh `.\logs\run_daily_submissions_latest.log` on each run.
+Generated payloads are archived under `.\submitted_payloads\challenge_<id>\`.
+
 Alternative:
 
 - Program/script: `python`
@@ -65,3 +69,6 @@ If you want ENTSO-E instead of the default SMARD baseline, append
 ```bash
 python run_daily_submissions.py --dry_run
 ```
+
+Without `--target_date`, the runner uses each selected challenge's
+`next_target_start` from the open challenge API.

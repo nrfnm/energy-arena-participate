@@ -15,7 +15,11 @@ import argparse
 import os
 import sys
 
-from _challenge_catalog import get_challenge_infos
+from _challenge_catalog import (
+    get_active_challenge_lookup,
+    get_challenge_infos,
+    resolve_target_date_from_entry,
+)
 from _starter_core import (
     DEFAULT_API_BASE,
     _get_default_data_source,
@@ -38,7 +42,10 @@ def main() -> None:
         "--target_date",
         type=str,
         default=None,
-        help="Target day in DD-MM-YYYY. Required unless --list_open_challenges or --check_setup is used.",
+        help=(
+            "Target day in DD-MM-YYYY. If omitted, the script uses the selected "
+            "challenge's next_target_start from --list_open_challenges."
+        ),
     )
     parser.add_argument(
         "--challenge_id",
@@ -144,23 +151,58 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
-    if not args.target_date:
-        print(
-            "Error: --target_date is required unless --list_open_challenges or --check_setup is used.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    challenge_id = str(args.challenge_id).strip()
 
-    try:
-        target_date = parse_target_date(args.target_date)
-    except ValueError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
+    active_lookup = None
+    if args.target_date:
+        try:
+            target_date = parse_target_date(args.target_date)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        try:
+            active_lookup = get_active_challenge_lookup(
+                args.api_base,
+                arena_api_key=arena_key or None,
+            )
+        except Exception as exc:
+            print(
+                "Error: --target_date was omitted and open challenge metadata "
+                f"could not be loaded: {exc}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        current_info = active_lookup.get(challenge_id)
+        if current_info is None:
+            print(
+                "Error: --target_date was omitted, but challenge "
+                f"'{challenge_id}' is not currently listed by /api/v1/challenges/open. "
+                "Pass --target_date explicitly.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        target_date = resolve_target_date_from_entry(current_info)
+        next_target_start = str(current_info.get("next_target_start") or "").strip()
+        if target_date is None:
+            print(
+                "Error: --target_date was omitted, but challenge "
+                f"'{challenge_id}' does not expose a parseable next_target_start "
+                "in /api/v1/challenges/open. Pass --target_date explicitly.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(
+            f"Target date defaulted to {target_date} from API next_target_start "
+            f"{next_target_start}"
+        )
 
     try:
         payload = build_payload(
             target_date=target_date,
-            challenge_id=args.challenge_id,
+            challenge_id=challenge_id,
             area=args.area or None,
             entsoe_api_key=entsoe_key,
             api_base=args.api_base,

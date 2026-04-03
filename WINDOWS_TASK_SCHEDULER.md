@@ -3,6 +3,10 @@
 This runs daily submissions at **11:30 CET/CEST** for all currently open
 challenges.
 
+The recommended wrapper writes logs to `.\logs\run_daily_submissions_*.log` and
+keeps a copy at `.\logs\run_daily_submissions_latest.log`.
+Generated payloads are archived under `.\submitted_payloads\challenge_<id>\`.
+
 ## Prerequisites
 
 - Python installed
@@ -51,6 +55,8 @@ Alternative:
 - Add arguments: `run_daily_submissions.py`
 - Start in: `C:\path\to\energy-arena-participate`
 
+The wrapper is preferred because it keeps timestamped log files for every run.
+
 Optional ENTSO-E mode:
 
 - Add arguments: `run_daily_submissions.py --data_source entsoe`
@@ -60,4 +66,6 @@ Optional ENTSO-E mode:
 1. Save the task
 2. Right-click the task and choose **Run**
 3. Confirm a successful run in Task Scheduler history
-4. Check the Energy Arena dashboard for resulting submissions
+4. Inspect `.\logs\run_daily_submissions_latest.log`
+5. Inspect `.\submitted_payloads\challenge_<id>\` for the archived JSON payloads
+6. Check the Energy Arena dashboard for resulting submissions

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date, datetime
 from typing import Any, Dict
 
 import requests
@@ -65,10 +66,35 @@ def get_active_challenge_lookup(
     for entry in body.get("active_challenges", []):
         if not isinstance(entry, dict):
             continue
-        challenge_id = entry.get("challenge_id")
-        if isinstance(challenge_id, str) and challenge_id:
+        challenge_id = str(entry.get("challenge_id") or "").strip()
+        if challenge_id:
             lookup[challenge_id] = entry
     return lookup
+
+
+def parse_catalog_datetime(raw: Any) -> datetime | None:
+    """
+    Parse an ISO-8601 datetime string returned by the challenge catalog.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def resolve_target_date_from_entry(entry: Dict[str, Any]) -> date | None:
+    """
+    Return the target date implied by ``next_target_start`` for one open challenge.
+    """
+    next_target_start = parse_catalog_datetime(entry.get("next_target_start"))
+    if next_target_start is None:
+        return None
+    return next_target_start.date()
 
 
 def get_challenge_detail(
